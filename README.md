@@ -72,9 +72,7 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json`):
       "command": "uvx",
       "args": ["dagster-mcp"],
       "env": {
-        "DAGSTER_URL": "http://localhost:3000",
-        "DAGSTER_API_TOKEN": "",
-        "DAGSTER_READ_ONLY": "true"
+        "DAGSTER_URL": "http://localhost:3000"
       }
     }
   }
@@ -90,9 +88,7 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json`):
       "command": "uv",
       "args": ["run", "--directory", "/path/to/dagster-mcp", "dagster-mcp"],
       "env": {
-        "DAGSTER_URL": "http://localhost:3000",
-        "DAGSTER_API_TOKEN": "",
-        "DAGSTER_READ_ONLY": "true"
+        "DAGSTER_URL": "http://localhost:3000"
       }
     }
   }
