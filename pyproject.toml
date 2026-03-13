@@ -1,0 +1,33 @@
+[project]
+name = "dagster-mcp"
+version = "0.1.0"
+description = "MCP server that wraps the Dagster GraphQL API — manage runs, assets, schedules, sensors, and backfills from any MCP client"
+license = {text = "MIT"}
+keywords = ["mcp", "dagster", "graphql", "data-pipelines", "orchestration"]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=2.0",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/fabdendev/dagster-mcp"
+Repository = "https://github.com/fabdendev/dagster-mcp"
+Issues = "https://github.com/fabdendev/dagster-mcp/issues"
+
+[project.scripts]
+dagster-mcp = "dagster_mcp.server:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=9.0", "ruff>=0.14"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dagster_mcp"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
