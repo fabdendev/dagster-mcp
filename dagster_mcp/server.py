@@ -512,27 +512,27 @@ def launch_job(
             {"key": k, "value": v} for k, v in tags.items()
         ]
 
-    asset_selection: list[dict] | None = None
+    solid_selection: list[str] | None = None
     if asset_keys:
-        asset_selection = [{"path": [k]} for k in asset_keys]
+        solid_selection = asset_keys
 
     query = """
     mutation LaunchJob(
       $locationName: String!,
       $repoName: String!,
       $jobName: String!,
-      $assetSelection: [AssetKeyInput!],
+      $solidSelection: [String!],
       $executionMetadata: ExecutionMetadata
     ) {
       launchRun(executionParams: {
         selector: {
           repositoryLocationName: $locationName,
           repositoryName: $repoName,
-          jobName: $jobName
+          jobName: $jobName,
+          solidSelection: $solidSelection
         },
         runConfigData: {},
-        executionMetadata: $executionMetadata,
-        assetSelection: $assetSelection
+        executionMetadata: $executionMetadata
       }) {
         ... on LaunchRunSuccess { run { runId status } }
         ... on InvalidSubsetError { message }
@@ -547,7 +547,7 @@ def launch_job(
         "locationName": repository_location,
         "repoName": repository_name,
         "jobName": job_name,
-        "assetSelection": asset_selection,
+        "solidSelection": solid_selection,
         "executionMetadata": execution_metadata or None,
     }
     data = gql(query, variables)
