@@ -194,7 +194,7 @@ def get_run_logs(run_id: str, cursor: str | None = None, limit: int = 100) -> di
               secondsToWait
               error { message causes { message } }
             }
-            ... on StepMaterializationEvent {
+            ... on MaterializationEvent {
               timestamp
               message
               level
