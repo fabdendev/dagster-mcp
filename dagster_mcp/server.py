@@ -126,17 +126,52 @@ def get_run_logs(run_id: str, cursor: str | None = None, limit: int = 100) -> di
     Captures step failures, run-level failures, retries, and general messages.
     """
     query = """
-    query RunLogs($runId: ID!, $cursor: String, $limit: Int!) {
-      logsForRun(runId: $runId, cursor: $cursor, limit: $limit) {
+    query RunLogs($runId: ID!, $afterCursor: String, $limit: Int!) {
+      logsForRun(runId: $runId, afterCursor: $afterCursor, limit: $limit) {
         ... on EventConnection {
           cursor
           hasMore
           events {
+            __typename
             ... on MessageEvent {
               timestamp
               message
               level
               stepKey
+            }
+            ... on LogsCapturedEvent {
+              timestamp
+              message
+              level
+              stepKey
+              logKey
+              fileKey
+            }
+            ... on ExecutionStepStartEvent {
+              timestamp
+              message
+              level
+              stepKey
+            }
+            ... on ExecutionStepSuccessEvent {
+              timestamp
+              message
+              level
+              stepKey
+            }
+            ... on ExecutionStepOutputEvent {
+              timestamp
+              message
+              level
+              stepKey
+              outputName
+            }
+            ... on ExecutionStepInputEvent {
+              timestamp
+              message
+              level
+              stepKey
+              inputName
             }
             ... on ExecutionStepFailureEvent {
               timestamp
@@ -159,6 +194,72 @@ def get_run_logs(run_id: str, cursor: str | None = None, limit: int = 100) -> di
               secondsToWait
               error { message causes { message } }
             }
+            ... on StepMaterializationEvent {
+              timestamp
+              message
+              level
+              stepKey
+            }
+            ... on ObjectStoreOperationEvent {
+              timestamp
+              message
+              level
+              stepKey
+            }
+            ... on HandledOutputEvent {
+              timestamp
+              message
+              level
+              stepKey
+            }
+            ... on LoadedInputEvent {
+              timestamp
+              message
+              level
+              stepKey
+            }
+            ... on EngineEvent {
+              timestamp
+              message
+              level
+              stepKey
+              error { message causes { message } }
+            }
+            ... on RunStartEvent {
+              timestamp
+              message
+              level
+            }
+            ... on RunSuccessEvent {
+              timestamp
+              message
+              level
+            }
+            ... on RunStartingEvent {
+              timestamp
+              message
+              level
+            }
+            ... on RunEnqueuedEvent {
+              timestamp
+              message
+              level
+            }
+            ... on RunDequeuedEvent {
+              timestamp
+              message
+              level
+            }
+            ... on RunCancelingEvent {
+              timestamp
+              message
+              level
+            }
+            ... on RunCanceledEvent {
+              timestamp
+              message
+              level
+            }
           }
         }
         ... on RunNotFoundError { message }
@@ -166,7 +267,7 @@ def get_run_logs(run_id: str, cursor: str | None = None, limit: int = 100) -> di
       }
     }
     """
-    data = gql(query, {"runId": run_id, "cursor": cursor, "limit": limit})
+    data = gql(query, {"runId": run_id, "afterCursor": cursor, "limit": limit})
     return data.get("logsForRun", {})
 
 
