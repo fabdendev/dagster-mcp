@@ -323,6 +323,159 @@ def get_run_stats(run_id: str) -> dict:
     return data.get("runOrError", {})
 
 
+@mcp.tool()
+def get_run_failure_summary(run_id: str) -> dict:
+    """Get a consolidated failure summary for a Dagster run: failed steps with
+    root-cause errors, per-step durations, and diagnostic suggestions.
+
+    Much faster than calling get_run_status + get_run_logs + get_run_stats separately.
+    """
+    # 1. Fetch run status + step stats in one query
+    status_query = """
+    query FailureSummary($runId: ID!) {
+      runOrError(runId: $runId) {
+        ... on Run {
+          runId
+          status
+          jobName
+          startTime
+          endTime
+          stepStats {
+            stepKey
+            status
+            startTime
+            endTime
+          }
+        }
+        ... on RunNotFoundError { message }
+        ... on PythonError { message }
+      }
+    }
+    """
+    run_data = gql(status_query, {"runId": run_id}).get("runOrError", {})
+
+    if "message" in run_data:
+        return run_data
+
+    status = run_data.get("status", "")
+    if status not in ("FAILURE", "CANCELED"):
+        return {"run_id": run_id, "status": status, "message": "Run did not fail."}
+
+    # 2. Collect error events from logs (paginate up to 500 events)
+    error_events: list[dict] = []
+    cursor = None
+    for _ in range(5):
+        log_query = """
+        query FailureLogs($runId: ID!, $afterCursor: String) {
+          logsForRun(runId: $runId, afterCursor: $afterCursor, limit: 100) {
+            ... on EventConnection {
+              cursor
+              hasMore
+              events {
+                __typename
+                ... on ExecutionStepFailureEvent {
+                  timestamp
+                  stepKey
+                  error { message causes { message } }
+                }
+                ... on RunFailureEvent {
+                  timestamp
+                  error { message causes { message } }
+                }
+                ... on ExecutionStepUpForRetryEvent {
+                  timestamp
+                  stepKey
+                  secondsToWait
+                  error { message causes { message } }
+                }
+              }
+            }
+            ... on RunNotFoundError { message }
+          }
+        }
+        """
+        log_data = gql(log_query, {"runId": run_id, "afterCursor": cursor}).get("logsForRun", {})
+        events = log_data.get("events", [])
+        for e in events:
+            if e.get("__typename") in (
+                "ExecutionStepFailureEvent", "RunFailureEvent", "ExecutionStepUpForRetryEvent"
+            ):
+                error_events.append(e)
+        if not log_data.get("hasMore"):
+            break
+        cursor = log_data.get("cursor")
+
+    # 3. Build step durations
+    step_stats = run_data.get("stepStats", [])
+    all_step_durations = []
+    for s in step_stats:
+        dur = None
+        if s.get("startTime") and s.get("endTime"):
+            dur = round(s["endTime"] - s["startTime"], 2)
+        all_step_durations.append({
+            "step_key": s["stepKey"],
+            "status": s["status"],
+            "duration_seconds": dur,
+        })
+
+    # 4. Build failed steps with errors
+    failed_step_keys = {s["stepKey"] for s in step_stats if s["status"] == "FAILURE"}
+    step_errors: dict[str, dict] = {}
+    for e in error_events:
+        sk = e.get("stepKey")
+        if sk and sk in failed_step_keys and sk not in step_errors:
+            step_errors[sk] = e.get("error", {})
+
+    failed_steps = []
+    for s in step_stats:
+        if s["stepKey"] in failed_step_keys:
+            dur = None
+            if s.get("startTime") and s.get("endTime"):
+                dur = round(s["endTime"] - s["startTime"], 2)
+            failed_steps.append({
+                "step_key": s["stepKey"],
+                "duration_seconds": dur,
+                "error": step_errors.get(s["stepKey"], {}),
+            })
+
+    # 5. Root cause error (run-level failure or first step failure)
+    root_cause = None
+    run_failure = [e for e in error_events if e.get("__typename") == "RunFailureEvent"]
+    if run_failure:
+        root_cause = run_failure[0].get("error", {})
+    elif failed_steps:
+        root_cause = failed_steps[0].get("error", {})
+
+    # 6. Suggestions
+    suggestions: list[str] = []
+    retries = [e for e in error_events if e.get("__typename") == "ExecutionStepUpForRetryEvent"]
+    if retries:
+        retry_keys = {e["stepKey"] for e in retries}
+        suggestions.append(f"Steps retried before failing: {', '.join(sorted(retry_keys))}")
+    if len(failed_steps) > 1:
+        suggestions.append(
+            f"Multiple steps failed ({len(failed_steps)}). "
+            f"First failure: {failed_steps[0]['step_key']} — downstream failures may be cascading."
+        )
+    if status == "CANCELED":
+        suggestions.append("Run was canceled, not all steps may have executed.")
+
+    run_dur = None
+    if run_data.get("startTime") and run_data.get("endTime"):
+        run_dur = round(run_data["endTime"] - run_data["startTime"], 2)
+
+    return {
+        "run_id": run_id,
+        "status": status,
+        "job_name": run_data.get("jobName"),
+        "duration_seconds": run_dur,
+        "failed_steps": failed_steps,
+        "root_cause_error": root_cause,
+        "all_step_durations": all_step_durations,
+        "suggestions": suggestions,
+    }
+
+
 # ── Assets ────────────────────────────────────────────────────────────────────
 
 

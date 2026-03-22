@@ -1,4 +1,11 @@
-from dagster_mcp.server import get_runs, get_run_status, get_run_logs, get_run_stats
+import json
+from unittest.mock import MagicMock
+
+import httpx
+
+from dagster_mcp.server import (
+    get_runs, get_run_status, get_run_logs, get_run_stats, get_run_failure_summary,
+)
 
 
 class TestGetRuns:
@@ -108,3 +115,123 @@ class TestGetRunStats:
         mock_gql({"data": {"runOrError": {"message": "Run not found"}}})
         result = get_run_stats("r999")
         assert result["message"] == "Run not found"
+
+
+def _make_mock_post(responses):
+    """Create a mock httpx.post that returns different responses on successive calls."""
+    call_count = 0
+
+    def _post(*args, **kwargs):
+        nonlocal call_count
+        resp_data = responses[min(call_count, len(responses) - 1)]
+        call_count += 1
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = resp_data
+        mock_resp.text = json.dumps(resp_data)
+        return mock_resp
+
+    return _post
+
+
+class TestGetRunFailureSummary:
+    def test_failed_run_two_steps(self, monkeypatch):
+        responses = [
+            # 1st call: status + stats
+            {"data": {"runOrError": {
+                "runId": "r1", "status": "FAILURE", "jobName": "job_a",
+                "startTime": 1000, "endTime": 1200,
+                "stepStats": [
+                    {"stepKey": "extract", "status": "SUCCESS",
+                     "startTime": 1000, "endTime": 1050},
+                    {"stepKey": "transform", "status": "FAILURE",
+                     "startTime": 1050, "endTime": 1100},
+                    {"stepKey": "load", "status": "FAILURE",
+                     "startTime": 1100, "endTime": 1150},
+                ],
+            }}},
+            # 2nd call: logs
+            {"data": {"logsForRun": {
+                "cursor": "c1", "hasMore": False,
+                "events": [
+                    {"__typename": "ExecutionStepFailureEvent",
+                     "timestamp": "1100", "stepKey": "transform",
+                     "error": {"message": "NullPointerError", "causes": [{"message": "col X is null"}]}},
+                    {"__typename": "ExecutionStepFailureEvent",
+                     "timestamp": "1150", "stepKey": "load",
+                     "error": {"message": "Upstream failed", "causes": []}},
+                    {"__typename": "RunFailureEvent",
+                     "timestamp": "1200",
+                     "error": {"message": "Steps failed", "causes": []}},
+                ],
+            }}},
+        ]
+        monkeypatch.setattr(httpx, "post", _make_mock_post(responses))
+        result = get_run_failure_summary("r1")
+
+        assert result["status"] == "FAILURE"
+        assert result["job_name"] == "job_a"
+        assert result["duration_seconds"] == 200.0
+        assert len(result["failed_steps"]) == 2
+        assert result["failed_steps"][0]["step_key"] == "transform"
+        assert result["failed_steps"][0]["error"]["message"] == "NullPointerError"
+        assert result["root_cause_error"]["message"] == "Steps failed"
+        assert len(result["all_step_durations"]) == 3
+        assert any("Multiple steps failed" in s for s in result["suggestions"])
+
+    def test_successful_run(self, mock_gql):
+        mock_gql({"data": {"runOrError": {
+            "runId": "r2", "status": "SUCCESS", "jobName": "j",
+            "startTime": 1000, "endTime": 1100,
+            "stepStats": [],
+        }}})
+        result = get_run_failure_summary("r2")
+        assert result["message"] == "Run did not fail."
+
+    def test_not_found(self, mock_gql):
+        mock_gql({"data": {"runOrError": {"message": "Run not found"}}})
+        result = get_run_failure_summary("r999")
+        assert result["message"] == "Run not found"
+
+    def test_canceled_run(self, monkeypatch):
+        responses = [
+            {"data": {"runOrError": {
+                "runId": "r3", "status": "CANCELED", "jobName": "j",
+                "startTime": 1000, "endTime": 1100,
+                "stepStats": [],
+            }}},
+            {"data": {"logsForRun": {
+                "cursor": None, "hasMore": False, "events": [],
+            }}},
+        ]
+        monkeypatch.setattr(httpx, "post", _make_mock_post(responses))
+        result = get_run_failure_summary("r3")
+        assert result["status"] == "CANCELED"
+        assert any("canceled" in s.lower() for s in result["suggestions"])
+
+    def test_retry_suggestion(self, monkeypatch):
+        responses = [
+            {"data": {"runOrError": {
+                "runId": "r4", "status": "FAILURE", "jobName": "j",
+                "startTime": 1000, "endTime": 1200,
+                "stepStats": [
+                    {"stepKey": "flaky", "status": "FAILURE",
+                     "startTime": 1000, "endTime": 1200},
+                ],
+            }}},
+            {"data": {"logsForRun": {
+                "cursor": None, "hasMore": False,
+                "events": [
+                    {"__typename": "ExecutionStepUpForRetryEvent",
+                     "timestamp": "1100", "stepKey": "flaky",
+                     "secondsToWait": 30,
+                     "error": {"message": "timeout", "causes": []}},
+                    {"__typename": "ExecutionStepFailureEvent",
+                     "timestamp": "1200", "stepKey": "flaky",
+                     "error": {"message": "timeout again", "causes": []}},
+                ],
+            }}},
+        ]
+        monkeypatch.setattr(httpx, "post", _make_mock_post(responses))
+        result = get_run_failure_summary("r4")
+        assert any("retried" in s.lower() for s in result["suggestions"])
