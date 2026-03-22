@@ -1,4 +1,6 @@
-from dagster_mcp.server import list_jobs, list_schedules, list_sensors
+import pytest
+
+from dagster_mcp.server import list_jobs, list_schedules, list_sensors, get_tick_history
 
 
 class TestListJobs:
@@ -68,3 +70,46 @@ class TestListSensors:
     def test_empty(self, mock_gql):
         mock_gql({"data": {"repositoriesOrError": {"nodes": []}}})
         assert list_sensors() == []
+
+
+class TestGetTickHistory:
+    def test_schedule_ticks(self, mock_gql):
+        mock_gql({"data": {"instigationStatesOrError": {"results": [
+            {"name": "daily_sched", "instigationType": "SCHEDULE", "ticks": [
+                {"tickId": "t1", "status": "SUCCESS", "timestamp": "1000",
+                 "error": None, "runIds": ["r1"]},
+                {"tickId": "t2", "status": "SKIPPED", "timestamp": "900",
+                 "error": None, "runIds": []},
+            ]},
+        ]}}})
+        result = get_tick_history("daily_sched", "SCHEDULE", limit=10)
+        assert result["name"] == "daily_sched"
+        assert len(result["ticks"]) == 2
+        assert result["ticks"][0]["status"] == "SUCCESS"
+        assert result["ticks"][0]["run_ids"] == ["r1"]
+
+    def test_sensor_ticks_with_error(self, mock_gql):
+        mock_gql({"data": {"instigationStatesOrError": {"results": [
+            {"name": "my_sensor", "instigationType": "SENSOR", "ticks": [
+                {"tickId": "t1", "status": "FAILURE", "timestamp": "1000",
+                 "error": {"message": "Connection refused"}, "runIds": []},
+            ]},
+        ]}}})
+        result = get_tick_history("my_sensor", "sensor")
+        assert result["ticks"][0]["error"] == "Connection refused"
+
+    def test_not_found(self, mock_gql):
+        mock_gql({"data": {"instigationStatesOrError": {"results": [
+            {"name": "other_sensor", "instigationType": "SENSOR", "ticks": []},
+        ]}}})
+        result = get_tick_history("missing_sensor", "SENSOR")
+        assert "not found" in result["message"]
+
+    def test_invalid_type(self, mock_gql):
+        with pytest.raises(ValueError, match="must be 'SCHEDULE' or 'SENSOR'"):
+            get_tick_history("x", "INVALID")
+
+    def test_python_error(self, mock_gql):
+        mock_gql({"data": {"instigationStatesOrError": {"message": "Something broke"}}})
+        result = get_tick_history("x", "SCHEDULE")
+        assert result["message"] == "Something broke"

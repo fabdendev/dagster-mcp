@@ -673,6 +673,69 @@ def list_sensors() -> list[dict]:
     return result
 
 
+@mcp.tool()
+def get_tick_history(
+    instigator_name: str,
+    instigator_type: str,
+    limit: int = 20,
+) -> dict:
+    """Get recent tick history for a schedule or sensor. Useful for detecting
+    silent failures in sensors or missed schedule ticks.
+
+    instigator_type must be 'SCHEDULE' or 'SENSOR'.
+    """
+    instigator_type = instigator_type.upper()
+    if instigator_type not in ("SCHEDULE", "SENSOR"):
+        raise ValueError("instigator_type must be 'SCHEDULE' or 'SENSOR'.")
+
+    query = """
+    query TickHistory($instigatorType: InstigationType!, $limit: Int!) {
+      instigationStatesOrError(instigationType: $instigatorType) {
+        ... on InstigationStates {
+          results {
+            name
+            instigationType
+            ticks(limit: $limit) {
+              tickId
+              status
+              timestamp
+              error { message }
+              runIds
+            }
+          }
+        }
+        ... on PythonError { message }
+      }
+    }
+    """
+    data = gql(query, {"instigatorType": instigator_type, "limit": limit})
+    states = data.get("instigationStatesOrError", {})
+
+    if "message" in states:
+        return states
+
+    results = states.get("results", [])
+    for r in results:
+        if r["name"] == instigator_name:
+            return {
+                "name": r["name"],
+                "instigator_type": r["instigationType"],
+                "ticks": [
+                    {
+                        "tick_id": t["tickId"],
+                        "status": t["status"],
+                        "timestamp": t["timestamp"],
+                        "error": t.get("error", {}).get("message") if t.get("error") else None,
+                        "run_ids": t.get("runIds", []),
+                    }
+                    for t in r.get("ticks", [])
+                ],
+            }
+
+    return {"name": instigator_name, "instigator_type": instigator_type,
+            "message": f"{instigator_type.capitalize()} '{instigator_name}' not found."}
+
+
 # ── Code Locations ────────────────────────────────────────────────────────────
 
 
