@@ -25,13 +25,21 @@ Exposes up to 19 tools that let you inspect, diagnose, and operate a Dagster ins
 
 ### Install
 
+The package is published on [PyPI](https://pypi.org/project/dagster-mcp/).
+
 **Option A — run directly with uvx (no clone needed):**
 
 ```bash
 uvx dagster-mcp
 ```
 
-**Option B — clone and run:**
+**Option B — install with pip:**
+
+```bash
+pip install dagster-mcp
+```
+
+**Option C — clone and run:**
 
 ```bash
 git clone https://github.com/fabdendev/dagster-mcp.git
