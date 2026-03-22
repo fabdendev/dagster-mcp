@@ -94,6 +94,59 @@ class TestGetRunLogs:
         result = get_run_logs("r999")
         assert "message" in result
 
+    def test_level_filter_error(self, mock_gql):
+        mock_gql({"data": {"logsForRun": {
+            "cursor": "c1", "hasMore": False,
+            "events": [
+                {"__typename": "RunStartEvent", "timestamp": "1000",
+                 "message": "Started", "level": "INFO"},
+                {"__typename": "EngineEvent", "timestamp": "1050",
+                 "message": "Warning msg", "level": "WARNING", "stepKey": None,
+                 "error": None},
+                {"__typename": "ExecutionStepFailureEvent", "timestamp": "1100",
+                 "message": "Step failed", "level": "ERROR", "stepKey": "step_a",
+                 "error": {"message": "boom", "causes": []}},
+                {"__typename": "RunFailureEvent", "timestamp": "1200",
+                 "message": "Run failed", "level": "CRITICAL",
+                 "error": {"message": "steps failed", "causes": []}},
+            ],
+        }}})
+        result = get_run_logs("r1", level_filter="ERROR")
+        # Should include the ERROR-level event AND the RunFailureEvent (even though CRITICAL)
+        assert len(result["events"]) == 2
+        types = {e["__typename"] for e in result["events"]}
+        assert "ExecutionStepFailureEvent" in types
+        assert "RunFailureEvent" in types
+
+    def test_level_filter_none_returns_all(self, mock_gql):
+        mock_gql({"data": {"logsForRun": {
+            "cursor": "c1", "hasMore": False,
+            "events": [
+                {"__typename": "RunStartEvent", "timestamp": "1000",
+                 "message": "Started", "level": "INFO"},
+                {"__typename": "ExecutionStepFailureEvent", "timestamp": "1100",
+                 "message": "Failed", "level": "ERROR", "stepKey": "s",
+                 "error": {"message": "x", "causes": []}},
+            ],
+        }}})
+        result = get_run_logs("r1", level_filter=None)
+        assert len(result["events"]) == 2
+
+    def test_level_filter_warning(self, mock_gql):
+        mock_gql({"data": {"logsForRun": {
+            "cursor": "c1", "hasMore": False,
+            "events": [
+                {"__typename": "EngineEvent", "timestamp": "1000",
+                 "message": "warn", "level": "WARNING", "stepKey": None,
+                 "error": None},
+                {"__typename": "RunStartEvent", "timestamp": "900",
+                 "message": "start", "level": "INFO"},
+            ],
+        }}})
+        result = get_run_logs("r1", level_filter="WARNING")
+        assert len(result["events"]) == 1
+        assert result["events"][0]["level"] == "WARNING"
+
 
 class TestGetRunStats:
     def test_step_stats(self, mock_gql):

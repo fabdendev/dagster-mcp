@@ -145,10 +145,17 @@ def get_run_status(run_id: str) -> dict:
 
 
 @mcp.tool()
-def get_run_logs(run_id: str, cursor: str | None = None, limit: int = 100) -> dict:
+def get_run_logs(
+    run_id: str,
+    cursor: str | None = None,
+    limit: int = 100,
+    level_filter: str | None = None,
+) -> dict:
     """Get logs/events for a Dagster run. Use cursor for pagination.
 
     Captures step failures, run-level failures, retries, and general messages.
+    Pass level_filter ('ERROR', 'WARNING', 'INFO', etc.) to only return events at that level.
+    For 'ERROR', also includes ExecutionStepFailureEvent and RunFailureEvent regardless of level.
     """
     query = """
     query RunLogs($runId: ID!, $afterCursor: String, $limit: Int!) {
@@ -293,7 +300,18 @@ def get_run_logs(run_id: str, cursor: str | None = None, limit: int = 100) -> di
     }
     """
     data = gql(query, {"runId": run_id, "afterCursor": cursor, "limit": limit})
-    return data.get("logsForRun", {})
+    result = data.get("logsForRun", {})
+
+    if level_filter and "events" in result:
+        upper = level_filter.upper()
+        error_types = ("ExecutionStepFailureEvent", "RunFailureEvent")
+        result["events"] = [
+            e for e in result["events"]
+            if e.get("level") == upper
+            or (upper == "ERROR" and e.get("__typename") in error_types)
+        ]
+
+    return result
 
 
 @mcp.tool()
