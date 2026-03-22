@@ -11,9 +11,13 @@ startCommand:
         type: string
         description: "Dagster Cloud API token (leave empty for self-hosted)"
         default: ""
+      dagsterExtraHeaders:
+        type: string
+        description: "JSON object of additional headers (e.g. {\"Authorization\":\"Bearer <token>\"})"
+        default: ""
       readOnly:
         type: string
         description: "Set to 'false' to enable write tools (launch, terminate, reload)"
         default: "true"
   commandFunction: |-
-    (config) => ({ command: 'uvx', args: ['dagster-mcp'], env: { DAGSTER_URL: config.dagsterUrl || 'http://localhost:3000', DAGSTER_API_TOKEN: config.dagsterApiToken || '', DAGSTER_READ_ONLY: config.readOnly || 'true' } })
+    (config) => ({ command: 'uvx', args: ['dagster-mcp'], env: { DAGSTER_URL: config.dagsterUrl || 'http://localhost:3000', DAGSTER_API_TOKEN: config.dagsterApiToken || '', DAGSTER_EXTRA_HEADERS: config.dagsterExtraHeaders || '', DAGSTER_READ_ONLY: config.readOnly || 'true' } })

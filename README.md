@@ -44,6 +44,7 @@ uv sync
 |----------|-------------|---------|
 | `DAGSTER_URL` | Base URL of your Dagster instance | `http://localhost:3000` |
 | `DAGSTER_API_TOKEN` | Dagster Cloud API token (leave empty for self-hosted) | _(empty)_ |
+| `DAGSTER_EXTRA_HEADERS` | JSON object of additional request headers sent to Dagster GraphQL | _(empty)_ |
 | `DAGSTER_READ_ONLY` | When `true`, only read tools are exposed (no launch/terminate/reload) | `true` |
 
 **Self-hosted:**
@@ -57,6 +58,12 @@ export DAGSTER_URL=http://localhost:3000
 ```bash
 export DAGSTER_URL=https://myorg.dagster.cloud/prod
 export DAGSTER_API_TOKEN=your-dagster-cloud-user-token
+```
+
+**Custom auth / proxy headers:**
+
+```bash
+export DAGSTER_EXTRA_HEADERS='{"Authorization":"Bearer your-token","X-My-Header":"value"}'
 ```
 
 ### Add to Claude Code

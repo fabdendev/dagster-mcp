@@ -1,5 +1,6 @@
 """Dagster MCP server — GraphQL wrapper for self-hosted and Dagster Cloud instances."""
 
+import json
 import os
 import httpx
 from fastmcp import FastMCP
@@ -7,6 +8,7 @@ from fastmcp import FastMCP
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://localhost:3000")
 GRAPHQL_URL = f"{DAGSTER_URL.rstrip('/')}/graphql"
 DAGSTER_API_TOKEN = os.environ.get("DAGSTER_API_TOKEN", "")
+DAGSTER_EXTRA_HEADERS = os.environ.get("DAGSTER_EXTRA_HEADERS", "")
 READ_ONLY = os.environ.get("DAGSTER_READ_ONLY", "true").lower() in ("true", "1", "yes")
 
 _mode = "read-only" if READ_ONLY else "read-write"
@@ -24,6 +26,29 @@ def _build_headers() -> dict[str, str]:
     headers: dict[str, str] = {}
     if DAGSTER_API_TOKEN:
         headers["Dagster-Cloud-Api-Token"] = DAGSTER_API_TOKEN
+    if DAGSTER_EXTRA_HEADERS:
+        try:
+            extra_headers = json.loads(DAGSTER_EXTRA_HEADERS)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "DAGSTER_EXTRA_HEADERS must be a valid JSON object "
+                "(example: '{\"Authorization\":\"Bearer token\"}')."
+            ) from exc
+
+        if not isinstance(extra_headers, dict):
+            raise RuntimeError("DAGSTER_EXTRA_HEADERS must be a JSON object.")
+
+        invalid_pairs = [
+            (key, value)
+            for key, value in extra_headers.items()
+            if not isinstance(key, str) or not isinstance(value, str)
+        ]
+        if invalid_pairs:
+            raise RuntimeError(
+                "DAGSTER_EXTRA_HEADERS keys and values must be strings."
+            )
+
+        headers.update(extra_headers)
     return headers
 
 
