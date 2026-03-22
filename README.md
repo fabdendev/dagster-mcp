@@ -4,12 +4,13 @@ An [MCP](https://modelcontextprotocol.io/) server that wraps the [Dagster](https
 
 ## What it does
 
-Exposes up to 15 tools that let you inspect and operate a Dagster instance (self-hosted or Dagster Cloud):
+Exposes up to 19 tools that let you inspect, diagnose, and operate a Dagster instance (self-hosted or Dagster Cloud):
 
-- **Runs** — list, inspect, get logs, get step stats
-- **Assets** — search, get details, get recent materializations
+- **Runs** — list, inspect, get logs (with level filtering), get step stats, get consolidated failure summaries
+- **Assets** — search, get details, get recent materializations, get consolidated health status
 - **Jobs** — list all jobs across code locations
-- **Schedules & Sensors** — list with status, cron, targets
+- **Schedules & Sensors** — list with status, cron, targets, inspect tick history
+- **Instance** — global health check (daemon status, run queue, code location errors)
 - **Code Locations** — list and reload
 - **Backfills** — list recent backfills
 - **Actions** — launch jobs, terminate runs, reload code locations _(opt-in, disabled by default)_
@@ -104,25 +105,51 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json`):
 
 ## Tools
 
+### Runs
+
 | Tool | Description |
 |------|-------------|
 | `get_runs` | List recent runs, filter by job name and/or status |
-| `get_run_status` | Get status and info for a specific run |
-| `get_run_logs` | Get logs/events for a run (with pagination) |
+| `get_run_status` | Get status, config, and run lineage (rootRunId, parentRunId) |
+| `get_run_logs` | Get logs/events for a run (with pagination and optional `level_filter`) |
 | `get_run_stats` | Get step-level stats (timing, materializations) |
+| `get_run_failure_summary` | **New** — consolidated failure diagnostics: failed steps, root cause error, per-step durations, and suggestions in a single call |
+
+### Assets
+
+| Tool | Description |
+|------|-------------|
 | `get_recent_materializations` | Get recent materializations for an asset |
 | `get_asset_details` | Get details, dependencies, and partitions for assets |
 | `search_assets` | Search/list assets by key prefix or group name |
+| `get_asset_health` | **New** — consolidated health view: last materialization, run status, freshness policy, staleness (works with single asset or group) |
+
+### Jobs, Schedules & Sensors
+
+| Tool | Description |
+|------|-------------|
 | `list_jobs` | List all jobs across all code locations |
 | `list_schedules` | List schedules with status, cron, and next tick |
 | `list_sensors` | List sensors with status and target jobs |
+| `get_tick_history` | **New** — tick history for a schedule or sensor (detect silent failures, see run associations) |
+
+### Instance & Code Locations
+
+| Tool | Description |
+|------|-------------|
+| `get_instance_status` | **New** — global health check: daemon health, queued run count, code location errors |
 | `list_code_locations` | List all code locations and their load status |
 | `list_backfills` | List recent backfills with status and progress |
-| `reload_code_location` | Reload a code location (e.g. after deploy) **(write)** |
-| `terminate_run` | Terminate a running run **(write)** |
-| `launch_job` | Launch a job or materialize specific assets **(write)** |
 
-Tools marked **(write)** are only available when `DAGSTER_READ_ONLY=false`.
+### Write Operations
+
+| Tool | Description |
+|------|-------------|
+| `reload_code_location` | Reload a code location (e.g. after deploy) |
+| `terminate_run` | Terminate a running run |
+| `launch_job` | Launch a job or materialize specific assets |
+
+Write tools are only available when `DAGSTER_READ_ONLY=false`.
 
 ## How it differs from the official Dagster MCP
 
@@ -141,6 +168,7 @@ Tested with Dagster 1.6+. All GraphQL queries target stable, non-deprecated API 
 ```bash
 uv sync --extra dev
 uv run ruff check dagster_mcp/    # lint
+uv run pytest                     # tests (77 tests)
 uv run python -m dagster_mcp      # start server locally
 ```
 
