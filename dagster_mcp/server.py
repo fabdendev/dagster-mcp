@@ -576,6 +576,111 @@ def search_assets(prefix: str | None = None, group: str | None = None) -> list[d
     return nodes
 
 
+@mcp.tool()
+def get_asset_health(asset_key_or_group: str) -> list[dict]:
+    """Get a consolidated health view for an asset key or all assets in a group.
+
+    Returns per-asset: last materialization, latest run status, freshness policy,
+    staleness info. Pass a single asset key or a group name.
+    """
+    # First try as a group — fetch all assets and filter
+    all_query = """
+    query AllAssets {
+      assetNodes {
+        assetKey { path }
+        groupName
+      }
+    }
+    """
+    all_data = gql(all_query)
+    all_nodes = all_data.get("assetNodes", [])
+
+    # Check if it's a group name
+    group_keys = [
+        n["assetKey"]["path"]
+        for n in all_nodes
+        if (n.get("groupName") or "").lower() == asset_key_or_group.lower()
+    ]
+
+    if group_keys:
+        asset_keys_input = [{"path": k} for k in group_keys]
+    else:
+        asset_keys_input = [{"path": [asset_key_or_group]}]
+
+    # Fetch health details
+    health_query = """
+    query AssetHealth($assetKeys: [AssetKeyInput!]!) {
+      assetNodes(assetKeys: $assetKeys) {
+        assetKey { path }
+        groupName
+        freshnessPolicy { maximumLagMinutes cronSchedule }
+        staleCauses { key { path } reason dependency { path } }
+        assetMaterializations(limit: 1) {
+          runId
+          timestamp
+        }
+      }
+    }
+    """
+    health_data = gql(health_query, {"assetKeys": asset_keys_input})
+    nodes = health_data.get("assetNodes", [])
+
+    if not nodes:
+        return [{"asset_key": asset_key_or_group, "message": "Asset not found."}]
+
+    # For each asset, get the latest run status if there's a materialization
+    run_ids = set()
+    for n in nodes:
+        mats = n.get("assetMaterializations", [])
+        if mats:
+            run_ids.add(mats[0]["runId"])
+
+    run_statuses: dict[str, str] = {}
+    if run_ids:
+        runs_query = """
+        query RunStatuses($filter: RunsFilter) {
+          runsOrError(filter: $filter, limit: 100) {
+            ... on Runs {
+              results { runId status }
+            }
+          }
+        }
+        """
+        runs_data = gql(runs_query, {"filter": {"runIds": list(run_ids)}})
+        for r in runs_data.get("runsOrError", {}).get("results", []):
+            run_statuses[r["runId"]] = r["status"]
+
+    results = []
+    for n in nodes:
+        mats = n.get("assetMaterializations", [])
+        last_mat = None
+        latest_run_status = None
+        if mats:
+            last_mat = {"run_id": mats[0]["runId"], "timestamp": mats[0]["timestamp"]}
+            latest_run_status = run_statuses.get(mats[0]["runId"])
+
+        fp = n.get("freshnessPolicy")
+        freshness_policy = None
+        if fp:
+            freshness_policy = {
+                "max_lag_minutes": fp.get("maximumLagMinutes"),
+                "cron": fp.get("cronSchedule"),
+            }
+
+        stale_causes = n.get("staleCauses", [])
+        results.append({
+            "asset_key": n["assetKey"]["path"],
+            "group": n.get("groupName"),
+            "last_materialization": last_mat,
+            "latest_run_status": latest_run_status,
+            "freshness_policy": freshness_policy,
+            "stale": len(stale_causes) > 0,
+            "stale_causes": [c.get("reason", "") for c in stale_causes],
+        })
+
+    return results
+
+
 # ── Jobs & Schedules & Sensors ────────────────────────────────────────────────
 
 
