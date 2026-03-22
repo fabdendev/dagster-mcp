@@ -134,6 +134,9 @@ def get_run_status(run_id: str) -> dict:
           jobName
           tags { key value }
           runConfigYaml
+          rootRunId
+          parentRunId
+          resolvedOpSelection
         }
         ... on RunNotFoundError { message }
         ... on PythonError { message }

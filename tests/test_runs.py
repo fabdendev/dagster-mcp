@@ -47,10 +47,27 @@ class TestGetRunStatus:
             "runId": "r1", "status": "SUCCESS", "startTime": 1000,
             "endTime": 1100, "jobName": "job_a", "tags": [],
             "runConfigYaml": "{}",
+            "rootRunId": "r1", "parentRunId": None,
+            "resolvedOpSelection": None,
         }}})
         result = get_run_status("r1")
         assert result["status"] == "SUCCESS"
         assert result["runId"] == "r1"
+        assert result["rootRunId"] == "r1"
+        assert result["parentRunId"] is None
+
+    def test_reexecuted_run(self, mock_gql):
+        mock_gql({"data": {"runOrError": {
+            "runId": "r2", "status": "SUCCESS", "startTime": 2000,
+            "endTime": 2100, "jobName": "job_a", "tags": [],
+            "runConfigYaml": "{}",
+            "rootRunId": "r1", "parentRunId": "r1",
+            "resolvedOpSelection": ["step_a"],
+        }}})
+        result = get_run_status("r2")
+        assert result["parentRunId"] == "r1"
+        assert result["rootRunId"] == "r1"
+        assert result["resolvedOpSelection"] == ["step_a"]
 
     def test_not_found(self, mock_gql):
         mock_gql({"data": {"runOrError": {"message": "Run r999 not found"}}})
