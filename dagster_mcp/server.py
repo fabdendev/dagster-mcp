@@ -703,6 +703,87 @@ def list_code_locations() -> list[dict]:
     return workspace.get("locationEntries", [])
 
 
+@mcp.tool()
+def get_instance_status() -> dict:
+    """Get a global health check of the Dagster instance: daemon health, queued run count,
+    and code location errors. Use this as a first call to understand if the instance is healthy."""
+    query = """
+    query InstanceStatus {
+      instance {
+        daemonHealth {
+          allDaemonStatuses {
+            daemonType
+            required
+            healthy
+            lastHeartbeatTime
+          }
+        }
+      }
+      runsOrError(filter: {statuses: [QUEUED]}, limit: 100) {
+        ... on Runs {
+          results { runId }
+        }
+        ... on PythonError { message }
+      }
+      workspaceOrError {
+        ... on Workspace {
+          locationEntries {
+            name
+            loadStatus
+            locationOrLoadError {
+              ... on PythonError { message }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = gql(query)
+
+    # Daemons
+    daemon_statuses = (
+        data.get("instance", {})
+        .get("daemonHealth", {})
+        .get("allDaemonStatuses", [])
+    )
+    daemons = [
+        {
+            "type": d["daemonType"],
+            "healthy": d["healthy"],
+            "last_heartbeat": d.get("lastHeartbeatTime"),
+            "required": d["required"],
+        }
+        for d in daemon_statuses
+    ]
+
+    # Queued runs
+    runs_or_error = data.get("runsOrError", {})
+    queued_runs = runs_or_error.get("results", [])
+    queued_count = len(queued_runs)
+
+    # Code location errors
+    location_entries = (
+        data.get("workspaceOrError", {}).get("locationEntries", [])
+    )
+    code_location_errors = []
+    for loc in location_entries:
+        err = loc.get("locationOrLoadError", {})
+        if "message" in err:
+            code_location_errors.append({"name": loc["name"], "error": err["message"]})
+
+    all_required_healthy = all(
+        d["healthy"] for d in daemons if d["required"]
+    )
+    healthy = all_required_healthy and len(code_location_errors) == 0
+
+    return {
+        "healthy": healthy,
+        "daemons": daemons,
+        "queued_runs_count": queued_count,
+        "code_location_errors": code_location_errors,
+    }
+
+
 def reload_code_location(location_name: str) -> dict:
     """Reload a code location by name (e.g. after a deploy). Returns the new load status."""
     query = """

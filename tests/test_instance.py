@@ -1,4 +1,4 @@
-from dagster_mcp.server import list_code_locations, list_backfills
+from dagster_mcp.server import list_code_locations, list_backfills, get_instance_status
 
 
 class TestListCodeLocations:
@@ -38,3 +38,71 @@ class TestListBackfills:
         list_backfills(limit=5)
         payload = mock_post.call_args.kwargs["json"]
         assert payload["variables"]["limit"] == 5
+
+
+def _instance_response(daemons=None, queued_runs=None, locations=None):
+    return {"data": {
+        "instance": {"daemonHealth": {"allDaemonStatuses": daemons or []}},
+        "runsOrError": {"results": queued_runs or []},
+        "workspaceOrError": {"locationEntries": locations or []},
+    }}
+
+
+class TestGetInstanceStatus:
+    def test_healthy(self, mock_gql):
+        mock_gql(_instance_response(
+            daemons=[
+                {"daemonType": "SCHEDULER", "required": True,
+                 "healthy": True, "lastHeartbeatTime": "1000"},
+                {"daemonType": "SENSOR", "required": True,
+                 "healthy": True, "lastHeartbeatTime": "1000"},
+            ],
+            locations=[
+                {"name": "loc1", "loadStatus": "LOADED",
+                 "locationOrLoadError": {"name": "loc1"}},
+            ],
+        ))
+        result = get_instance_status()
+        assert result["healthy"] is True
+        assert len(result["daemons"]) == 2
+        assert result["queued_runs_count"] == 0
+        assert result["code_location_errors"] == []
+
+    def test_unhealthy_daemon(self, mock_gql):
+        mock_gql(_instance_response(
+            daemons=[
+                {"daemonType": "SCHEDULER", "required": True,
+                 "healthy": False, "lastHeartbeatTime": "500"},
+            ],
+        ))
+        result = get_instance_status()
+        assert result["healthy"] is False
+        assert result["daemons"][0]["healthy"] is False
+
+    def test_code_location_error(self, mock_gql):
+        mock_gql(_instance_response(
+            daemons=[
+                {"daemonType": "SCHEDULER", "required": True,
+                 "healthy": True, "lastHeartbeatTime": "1000"},
+            ],
+            locations=[
+                {"name": "broken_loc", "loadStatus": "LOADED",
+                 "locationOrLoadError": {"message": "ImportError: no module"}},
+            ],
+        ))
+        result = get_instance_status()
+        assert result["healthy"] is False
+        assert len(result["code_location_errors"]) == 1
+        assert result["code_location_errors"][0]["name"] == "broken_loc"
+
+    def test_queued_runs(self, mock_gql):
+        mock_gql(_instance_response(
+            daemons=[
+                {"daemonType": "SCHEDULER", "required": True,
+                 "healthy": True, "lastHeartbeatTime": "1000"},
+            ],
+            queued_runs=[{"runId": "r1"}, {"runId": "r2"}, {"runId": "r3"}],
+        ))
+        result = get_instance_status()
+        assert result["queued_runs_count"] == 3
+        assert result["healthy"] is True
