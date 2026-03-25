@@ -6,29 +6,101 @@ import httpx
 from fastmcp import FastMCP
 
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://localhost:3000")
-GRAPHQL_URL = f"{DAGSTER_URL.rstrip('/')}/graphql"
 DAGSTER_API_TOKEN = os.environ.get("DAGSTER_API_TOKEN", "")
 DAGSTER_EXTRA_HEADERS = os.environ.get("DAGSTER_EXTRA_HEADERS", "")
 READ_ONLY = os.environ.get("DAGSTER_READ_ONLY", "true").lower() in ("true", "1", "yes")
 
+# Multi-env support
+_DAGSTER_ENVS_RAW = os.environ.get("DAGSTER_ENVS", "")
+_DAGSTER_DEFAULT_ENV = os.environ.get("DAGSTER_DEFAULT_ENV", "")
+
+
+def _parse_dagster_envs(raw: str) -> dict[str, dict]:
+    if not raw:
+        return {}
+    try:
+        envs = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "DAGSTER_ENVS must be a valid JSON object "
+            '(example: \'{"prod": {"url": "https://prod.dagster.io", "token": "..."}, '
+            '"dev": {"url": "http://localhost:3000"}}\').'
+        ) from exc
+    if not isinstance(envs, dict):
+        raise RuntimeError("DAGSTER_ENVS must be a JSON object mapping env names to configs.")
+    return envs
+
+
+_ENVS: dict[str, dict] = _parse_dagster_envs(_DAGSTER_ENVS_RAW)
+
 _mode = "read-only" if READ_ONLY else "read-write"
+_env_info = (
+    f"Available environments: {', '.join(_ENVS)}. Pass env=<name> to each tool. "
+    if _ENVS
+    else ""
+)
 mcp = FastMCP(
     "dagster",
     instructions=(
         f"Use these tools to monitor and operate a running Dagster instance ({_mode} mode). "
+        f"{_env_info}"
         "Start with list_jobs or get_runs to explore what is available, then "
         "drill into specific runs, assets, schedules, or sensors as needed."
     ),
 )
 
 
-def _build_headers() -> dict[str, str]:
+def _resolve_connection(env: str | None) -> tuple[str, str, str]:
+    """Return (graphql_url, api_token, extra_headers_json) for the given env.
+
+    In single-env mode (DAGSTER_ENVS not set), env is ignored and module-level
+    DAGSTER_URL / DAGSTER_API_TOKEN / DAGSTER_EXTRA_HEADERS are used.
+    """
+    if not _ENVS:
+        return (
+            f"{DAGSTER_URL.rstrip('/')}/graphql",
+            DAGSTER_API_TOKEN,
+            DAGSTER_EXTRA_HEADERS,
+        )
+
+    name = env or _DAGSTER_DEFAULT_ENV
+    if not name:
+        if len(_ENVS) == 1:
+            name = next(iter(_ENVS))
+        else:
+            raise RuntimeError(
+                f"Multiple Dagster envs configured but no env specified. "
+                f"Available: {', '.join(_ENVS)}. "
+                "Pass env=<name> to the tool or set DAGSTER_DEFAULT_ENV."
+            )
+
+    if name not in _ENVS:
+        raise RuntimeError(
+            f"Unknown Dagster env '{name}'. Available: {', '.join(_ENVS)}."
+        )
+
+    cfg = _ENVS[name]
+    url = cfg.get("url", "http://localhost:3000")
+    token = cfg.get("token", "")
+    extra = cfg.get("extra_headers", "")
+    return f"{url.rstrip('/')}/graphql", token, extra
+
+
+def _build_headers(
+    api_token: str | None = None,
+    extra_headers_json: str | None = None,
+) -> dict[str, str]:
+    if api_token is None:
+        api_token = DAGSTER_API_TOKEN
+    if extra_headers_json is None:
+        extra_headers_json = DAGSTER_EXTRA_HEADERS
+
     headers: dict[str, str] = {}
-    if DAGSTER_API_TOKEN:
-        headers["Dagster-Cloud-Api-Token"] = DAGSTER_API_TOKEN
-    if DAGSTER_EXTRA_HEADERS:
+    if api_token:
+        headers["Dagster-Cloud-Api-Token"] = api_token
+    if extra_headers_json:
         try:
-            extra_headers = json.loads(DAGSTER_EXTRA_HEADERS)
+            extra_headers = json.loads(extra_headers_json)
         except json.JSONDecodeError as exc:
             raise RuntimeError(
                 "DAGSTER_EXTRA_HEADERS must be a valid JSON object "
@@ -52,22 +124,26 @@ def _build_headers() -> dict[str, str]:
     return headers
 
 
-def gql(query: str, variables: dict | None = None) -> dict:
+def gql(query: str, variables: dict | None = None, env: str | None = None) -> dict:
+    graphql_url, api_token, extra_headers_json = _resolve_connection(env)
+    headers = _build_headers(api_token, extra_headers_json)
     try:
         response = httpx.post(
-            GRAPHQL_URL,
+            graphql_url,
             json={"query": query, "variables": variables or {}},
-            headers=_build_headers(),
+            headers=headers,
             timeout=30,
         )
     except httpx.ConnectError:
+        base_url = graphql_url.removesuffix("/graphql")
         raise RuntimeError(
-            f"Cannot connect to Dagster at {DAGSTER_URL}. "
+            f"Cannot connect to Dagster at {base_url}. "
             "Check that DAGSTER_URL is correct and the instance is running."
         )
     except httpx.TimeoutException:
+        base_url = graphql_url.removesuffix("/graphql")
         raise RuntimeError(
-            f"Request to Dagster at {DAGSTER_URL} timed out after 30s."
+            f"Request to Dagster at {base_url} timed out after 30s."
         )
     if response.status_code >= 400:
         raise RuntimeError(
@@ -88,6 +164,7 @@ def get_runs(
     job_name: str | None = None,
     statuses: list[str] | None = None,
     limit: int = 10,
+    env: str | None = None,
 ) -> list[dict]:
     """Get recent Dagster runs, optionally filtered by job name and/or statuses.
 
@@ -115,13 +192,13 @@ def get_runs(
         filter_var["statuses"] = statuses
     if job_name:
         filter_var["jobName"] = job_name
-    data = gql(query, {"limit": limit, "filter": filter_var or None})
+    data = gql(query, {"limit": limit, "filter": filter_var or None}, env=env)
     runs = data.get("runsOrError", {})
     return runs.get("results", [])
 
 
 @mcp.tool()
-def get_run_status(run_id: str) -> dict:
+def get_run_status(run_id: str, env: str | None = None) -> dict:
     """Get the status, config, and failure reason of a Dagster run by run ID."""
     query = """
     query RunStatus($runId: ID!) {
@@ -143,7 +220,7 @@ def get_run_status(run_id: str) -> dict:
       }
     }
     """
-    data = gql(query, {"runId": run_id})
+    data = gql(query, {"runId": run_id}, env=env)
     return data.get("runOrError", {})
 
 
@@ -153,6 +230,7 @@ def get_run_logs(
     cursor: str | None = None,
     limit: int = 100,
     level_filter: str | None = None,
+    env: str | None = None,
 ) -> dict:
     """Get logs/events for a Dagster run. Use cursor for pagination.
 
@@ -302,7 +380,7 @@ def get_run_logs(
       }
     }
     """
-    data = gql(query, {"runId": run_id, "afterCursor": cursor, "limit": limit})
+    data = gql(query, {"runId": run_id, "afterCursor": cursor, "limit": limit}, env=env)
     result = data.get("logsForRun", {})
 
     if level_filter and "events" in result:
@@ -318,7 +396,7 @@ def get_run_logs(
 
 
 @mcp.tool()
-def get_run_stats(run_id: str) -> dict:
+def get_run_stats(run_id: str, env: str | None = None) -> dict:
     """Get step-level statistics for a Dagster run (timing, materialization counts, expectations)."""
     query = """
     query RunStats($runId: ID!) {
@@ -340,12 +418,12 @@ def get_run_stats(run_id: str) -> dict:
       }
     }
     """
-    data = gql(query, {"runId": run_id})
+    data = gql(query, {"runId": run_id}, env=env)
     return data.get("runOrError", {})
 
 
 @mcp.tool()
-def get_run_failure_summary(run_id: str) -> dict:
+def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
     """Get a consolidated failure summary for a Dagster run: failed steps with
     root-cause errors, per-step durations, and diagnostic suggestions.
 
@@ -373,7 +451,7 @@ def get_run_failure_summary(run_id: str) -> dict:
       }
     }
     """
-    run_data = gql(status_query, {"runId": run_id}).get("runOrError", {})
+    run_data = gql(status_query, {"runId": run_id}, env=env).get("runOrError", {})
 
     if "message" in run_data:
         return run_data
@@ -415,7 +493,7 @@ def get_run_failure_summary(run_id: str) -> dict:
           }
         }
         """
-        log_data = gql(log_query, {"runId": run_id, "afterCursor": cursor}).get("logsForRun", {})
+        log_data = gql(log_query, {"runId": run_id, "afterCursor": cursor}, env=env).get("logsForRun", {})
         events = log_data.get("events", [])
         for e in events:
             if e.get("__typename") in (
@@ -501,7 +579,11 @@ def get_run_failure_summary(run_id: str) -> dict:
 
 
 @mcp.tool()
-def get_recent_materializations(asset_key: str, limit: int = 5) -> list[dict]:
+def get_recent_materializations(
+    asset_key: str,
+    limit: int = 5,
+    env: str | None = None,
+) -> list[dict]:
     """Get the most recent materializations for a given asset key (e.g. 'my_daily_report')."""
     query = """
     query AssetRuns($assetKey: AssetKeyInput!, $limit: Int!) {
@@ -522,13 +604,13 @@ def get_recent_materializations(asset_key: str, limit: int = 5) -> list[dict]:
       }
     }
     """
-    data = gql(query, {"assetKey": {"path": [asset_key]}, "limit": limit})
+    data = gql(query, {"assetKey": {"path": [asset_key]}, "limit": limit}, env=env)
     asset = data.get("assetOrError", {})
     return asset.get("assetMaterializations", [])
 
 
 @mcp.tool()
-def get_asset_details(asset_keys: list[str]) -> list[dict]:
+def get_asset_details(asset_keys: list[str], env: str | None = None) -> list[dict]:
     """Get details for a list of asset keys: description, dependencies, group, latest materialization."""
     query = """
     query AssetDetails($assetKeys: [AssetKeyInput!]!) {
@@ -550,12 +632,16 @@ def get_asset_details(asset_keys: list[str]) -> list[dict]:
     }
     """
     keys = [{"path": [k]} for k in asset_keys]
-    data = gql(query, {"assetKeys": keys})
+    data = gql(query, {"assetKeys": keys}, env=env)
     return data.get("assetNodes", [])
 
 
 @mcp.tool()
-def search_assets(prefix: str | None = None, group: str | None = None) -> list[dict]:
+def search_assets(
+    prefix: str | None = None,
+    group: str | None = None,
+    env: str | None = None,
+) -> list[dict]:
     """Search/list all asset nodes. Optionally filter by key prefix or group name (client-side)."""
     query = """
     query AllAssets {
@@ -568,7 +654,7 @@ def search_assets(prefix: str | None = None, group: str | None = None) -> list[d
       }
     }
     """
-    data = gql(query)
+    data = gql(query, env=env)
     nodes = data.get("assetNodes", [])
     if prefix:
         prefix_lower = prefix.lower()
@@ -580,7 +666,7 @@ def search_assets(prefix: str | None = None, group: str | None = None) -> list[d
 
 
 @mcp.tool()
-def get_asset_health(asset_key_or_group: str) -> list[dict]:
+def get_asset_health(asset_key_or_group: str, env: str | None = None) -> list[dict]:
     """Get a consolidated health view for an asset key or all assets in a group.
 
     Returns per-asset: last materialization, latest run status, freshness policy,
@@ -595,7 +681,7 @@ def get_asset_health(asset_key_or_group: str) -> list[dict]:
       }
     }
     """
-    all_data = gql(all_query)
+    all_data = gql(all_query, env=env)
     all_nodes = all_data.get("assetNodes", [])
 
     # Check if it's a group name
@@ -625,7 +711,7 @@ def get_asset_health(asset_key_or_group: str) -> list[dict]:
       }
     }
     """
-    health_data = gql(health_query, {"assetKeys": asset_keys_input})
+    health_data = gql(health_query, {"assetKeys": asset_keys_input}, env=env)
     nodes = health_data.get("assetNodes", [])
 
     if not nodes:
@@ -649,7 +735,7 @@ def get_asset_health(asset_key_or_group: str) -> list[dict]:
           }
         }
         """
-        runs_data = gql(runs_query, {"filter": {"runIds": list(run_ids)}})
+        runs_data = gql(runs_query, {"filter": {"runIds": list(run_ids)}}, env=env)
         for r in runs_data.get("runsOrError", {}).get("results", []):
             run_statuses[r["runId"]] = r["status"]
 
@@ -688,7 +774,7 @@ def get_asset_health(asset_key_or_group: str) -> list[dict]:
 
 
 @mcp.tool()
-def list_jobs() -> list[dict]:
+def list_jobs(env: str | None = None) -> list[dict]:
     """List all jobs/pipelines available in the Dagster instance."""
     query = """
     query ListJobs {
@@ -707,7 +793,7 @@ def list_jobs() -> list[dict]:
       }
     }
     """
-    data = gql(query)
+    data = gql(query, env=env)
     repos = data.get("repositoriesOrError", {}).get("nodes", [])
     result = []
     for repo in repos:
@@ -722,7 +808,7 @@ def list_jobs() -> list[dict]:
 
 
 @mcp.tool()
-def list_schedules() -> list[dict]:
+def list_schedules(env: str | None = None) -> list[dict]:
     """List all schedules with their status, cron interval, and next tick."""
     query = """
     query ListSchedules {
@@ -744,7 +830,7 @@ def list_schedules() -> list[dict]:
       }
     }
     """
-    data = gql(query)
+    data = gql(query, env=env)
     repos = data.get("repositoriesOrError", {}).get("nodes", [])
     result = []
     for repo in repos:
@@ -763,7 +849,7 @@ def list_schedules() -> list[dict]:
 
 
 @mcp.tool()
-def list_sensors() -> list[dict]:
+def list_sensors(env: str | None = None) -> list[dict]:
     """List all sensors with their status and target jobs."""
     query = """
     query ListSensors {
@@ -783,7 +869,7 @@ def list_sensors() -> list[dict]:
       }
     }
     """
-    data = gql(query)
+    data = gql(query, env=env)
     repos = data.get("repositoriesOrError", {}).get("nodes", [])
     result = []
     for repo in repos:
@@ -804,6 +890,7 @@ def get_tick_history(
     instigator_name: str,
     instigator_type: str,
     limit: int = 20,
+    env: str | None = None,
 ) -> dict:
     """Get recent tick history for a schedule or sensor. Useful for detecting
     silent failures in sensors or missed schedule ticks.
@@ -834,7 +921,7 @@ def get_tick_history(
       }
     }
     """
-    data = gql(query, {"instigatorType": instigator_type, "limit": limit})
+    data = gql(query, {"instigatorType": instigator_type, "limit": limit}, env=env)
     states = data.get("instigationStatesOrError", {})
 
     if "message" in states:
@@ -866,7 +953,7 @@ def get_tick_history(
 
 
 @mcp.tool()
-def list_code_locations() -> list[dict]:
+def list_code_locations(env: str | None = None) -> list[dict]:
     """List all code locations (repository locations) and their load status."""
     query = """
     query CodeLocations {
@@ -887,13 +974,13 @@ def list_code_locations() -> list[dict]:
       }
     }
     """
-    data = gql(query)
+    data = gql(query, env=env)
     workspace = data.get("workspaceOrError", {})
     return workspace.get("locationEntries", [])
 
 
 @mcp.tool()
-def get_instance_status() -> dict:
+def get_instance_status(env: str | None = None) -> dict:
     """Get a global health check of the Dagster instance: daemon health, queued run count,
     and code location errors. Use this as a first call to understand if the instance is healthy."""
     query = """
@@ -927,7 +1014,7 @@ def get_instance_status() -> dict:
       }
     }
     """
-    data = gql(query)
+    data = gql(query, env=env)
 
     # Daemons
     daemon_statuses = (
@@ -973,7 +1060,7 @@ def get_instance_status() -> dict:
     }
 
 
-def reload_code_location(location_name: str) -> dict:
+def reload_code_location(location_name: str, env: str | None = None) -> dict:
     """Reload a code location by name (e.g. after a deploy). Returns the new load status."""
     query = """
     mutation ReloadLocation($location: String!) {
@@ -992,7 +1079,7 @@ def reload_code_location(location_name: str) -> dict:
       }
     }
     """
-    data = gql(query, {"location": location_name})
+    data = gql(query, {"location": location_name}, env=env)
     return data.get("reloadRepositoryLocation", {})
 
 
@@ -1000,7 +1087,7 @@ def reload_code_location(location_name: str) -> dict:
 
 
 @mcp.tool()
-def list_backfills(limit: int = 10) -> list[dict]:
+def list_backfills(limit: int = 10, env: str | None = None) -> list[dict]:
     """List recent backfills with their status and progress."""
     query = """
     query Backfills($limit: Int!, $cursor: String) {
@@ -1019,14 +1106,14 @@ def list_backfills(limit: int = 10) -> list[dict]:
       }
     }
     """
-    data = gql(query, {"limit": limit})
+    data = gql(query, {"limit": limit}, env=env)
     return data.get("partitionBackfillsOrError", {}).get("results", [])
 
 
 # ── Actions ───────────────────────────────────────────────────────────────────
 
 
-def terminate_run(run_id: str) -> dict:
+def terminate_run(run_id: str, env: str | None = None) -> dict:
     """Terminate/stop a running Dagster run by run ID."""
     query = """
     mutation TerminateRun($runId: String!) {
@@ -1038,7 +1125,7 @@ def terminate_run(run_id: str) -> dict:
       }
     }
     """
-    data = gql(query, {"runId": run_id})
+    data = gql(query, {"runId": run_id}, env=env)
     return data.get("terminateRun", {})
 
 
@@ -1048,6 +1135,7 @@ def launch_job(
     repository_name: str = "__repository__",
     asset_keys: list[str] | None = None,
     tags: dict[str, str] | None = None,
+    env: str | None = None,
 ) -> dict:
     """Launch a Dagster job or materialize specific assets.
 
@@ -1099,7 +1187,7 @@ def launch_job(
         "solidSelection": solid_selection,
         "executionMetadata": execution_metadata or None,
     }
-    data = gql(query, variables)
+    data = gql(query, variables, env=env)
     return data.get("launchRun", {})
 
 

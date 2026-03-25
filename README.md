@@ -49,6 +49,8 @@ uv sync
 
 ### Configure
 
+#### Single environment
+
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DAGSTER_URL` | Base URL of your Dagster instance | `http://localhost:3000` |
@@ -75,11 +77,31 @@ export DAGSTER_API_TOKEN=your-dagster-cloud-user-token
 export DAGSTER_EXTRA_HEADERS='{"Authorization":"Bearer your-token","X-My-Header":"value"}'
 ```
 
+#### Multiple environments
+
+Use `DAGSTER_ENVS` to configure several Dagster instances in one server. Every tool then accepts an optional `env` parameter so the LLM can target the right instance.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DAGSTER_ENVS` | JSON object mapping env names to `{url, token?, extra_headers?}` configs | _(empty)_ |
+| `DAGSTER_DEFAULT_ENV` | Env name to use when `env` is not passed to a tool | _(empty)_ |
+
+```bash
+export DAGSTER_ENVS='{
+  "prod": {"url": "https://myorg.dagster.cloud/prod", "token": "prod-token"},
+  "staging": {"url": "https://myorg.dagster.cloud/staging", "token": "stg-token"},
+  "dev": {"url": "http://localhost:3000"}
+}'
+export DAGSTER_DEFAULT_ENV=prod
+```
+
+When `DAGSTER_ENVS` is set, `DAGSTER_URL` / `DAGSTER_API_TOKEN` / `DAGSTER_EXTRA_HEADERS` are ignored. If only one env is defined, it is used automatically even without `DAGSTER_DEFAULT_ENV`.
+
 ### Add to Claude Code
 
 Add to your Claude Code MCP settings (`~/.claude/settings.json`):
 
-**If using uvx:**
+**If using uvx (single env):**
 
 ```json
 {
@@ -89,6 +111,23 @@ Add to your Claude Code MCP settings (`~/.claude/settings.json`):
       "args": ["dagster-mcp"],
       "env": {
         "DAGSTER_URL": "http://localhost:3000"
+      }
+    }
+  }
+}
+```
+
+**If using uvx (multiple envs):**
+
+```json
+{
+  "mcpServers": {
+    "dagster": {
+      "command": "uvx",
+      "args": ["dagster-mcp"],
+      "env": {
+        "DAGSTER_ENVS": "{\"prod\":{\"url\":\"https://myorg.dagster.cloud/prod\",\"token\":\"prod-token\"},\"dev\":{\"url\":\"http://localhost:3000\"}}",
+        "DAGSTER_DEFAULT_ENV": "prod"
       }
     }
   }
@@ -176,7 +215,7 @@ Tested with Dagster 1.6+. All GraphQL queries target stable, non-deprecated API 
 ```bash
 uv sync --extra dev
 uv run ruff check dagster_mcp/    # lint
-uv run pytest                     # tests (77 tests)
+uv run pytest                     # tests (95 tests)
 uv run python -m dagster_mcp      # start server locally
 ```
 
