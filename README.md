@@ -4,7 +4,7 @@
 [![PyPI downloads](https://img.shields.io/pypi/dm/dagster-mcp)](https://pypi.org/project/dagster-mcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-98%20passed-brightgreen.svg)](#development)
+[![Tests](https://github.com/fabdendev/dagster-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/fabdendev/dagster-mcp/actions/workflows/tests.yml)
 
 An [MCP](https://modelcontextprotocol.io/) server that gives AI agents full visibility and control over your [Dagster](https://dagster.io/) instance — like an SRE for your data pipelines.
 
