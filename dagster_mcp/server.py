@@ -209,9 +209,24 @@ def get_runs(
     limit: int = 10,
     env: str | None = None,
 ) -> list[dict]:
-    """Get recent Dagster runs, optionally filtered by job name and/or statuses.
+    """List recent pipeline runs. Start here to discover what has been running.
 
-    statuses examples: ['SUCCESS'], ['FAILURE', 'CANCELED'], ['STARTED', 'QUEUED']
+    Returns runId, status, jobName, startTime, endTime, and tags for each run.
+    Use the returned runId to drill into details with get_run_status,
+    get_run_logs, get_run_stats, or get_run_failure_summary.
+
+    Filtering:
+    - job_name: filter by job (e.g. 'my_etl_job')
+    - statuses: filter by one or more statuses.
+      Valid values: 'SUCCESS', 'FAILURE', 'CANCELED', 'STARTED', 'QUEUED',
+      'STARTING', 'CANCELING', 'NOT_STARTED'.
+      Examples: ['FAILURE'], ['FAILURE', 'CANCELED'], ['STARTED', 'QUEUED']
+    - limit: max runs to return (default 10)
+
+    Typical workflows:
+    - Find recent failures: get_runs(statuses=['FAILURE'])
+    - Check if a job ran today: get_runs(job_name='my_job', limit=5)
+    - Monitor active runs: get_runs(statuses=['STARTED', 'QUEUED'])
     """
     query = """
     query Runs($limit: Int!, $filter: RunsFilter) {
@@ -243,7 +258,18 @@ def get_runs(
 
 @mcp.tool()
 def get_run_status(run_id: str, env: str | None = None) -> dict:
-    """Get the status, config, and failure reason of a Dagster run by run ID."""
+    """Get full details for a single run: status, config, tags, and run lineage.
+
+    Returns: runId, status, startTime, endTime, jobName, tags, runConfigYaml,
+    rootRunId, parentRunId, resolvedOpSelection.
+
+    Use rootRunId and parentRunId to understand re-execution chains — if
+    parentRunId is set, this run was re-executed from another run.
+    resolvedOpSelection shows which steps were selected for re-execution.
+
+    When to use: after get_runs to inspect a specific run, or to check
+    whether a run is a re-execution of a previous one.
+    """
     query = """
     query RunStatus($runId: ID!) {
       runOrError(runId: $runId) {
@@ -276,11 +302,26 @@ def get_run_logs(
     level_filter: str | None = None,
     env: str | None = None,
 ) -> dict:
-    """Get logs/events for a Dagster run. Use cursor for pagination.
+    """Get structured log events for a run, with optional severity filtering and pagination.
 
-    Captures step failures, run-level failures, retries, and general messages.
-    Pass level_filter ('ERROR', 'WARNING', 'INFO', etc.) to only return events at that level.
-    For 'ERROR', also includes ExecutionStepFailureEvent and RunFailureEvent regardless of level.
+    Returns events with __typename, timestamp, message, level, and (where applicable)
+    stepKey and error details. Events include step starts/completions, failures,
+    retries, materializations, and run-level events.
+
+    Parameters:
+    - run_id: the run to fetch logs for
+    - level_filter: only return events at this level or above.
+      Values: 'DEBUG', 'INFO', 'WARNING', 'ERROR'. When set to 'ERROR',
+      also includes ExecutionStepFailureEvent and RunFailureEvent regardless
+      of their level field. Default: None (return all events).
+    - cursor: pagination cursor returned in previous response. Pass the
+      cursor from the last call to get the next page.
+    - limit: max events per page (default 100)
+
+    When to use: to investigate what happened during a run. For a quick
+    failure diagnosis, prefer get_run_failure_summary instead — it returns
+    a consolidated view in a single call. Use get_run_logs when you need
+    the full event stream or want to filter by level.
     """
     query = """
     query RunLogs($runId: ID!, $afterCursor: String, $limit: Int!) {
@@ -441,7 +482,17 @@ def get_run_logs(
 
 @mcp.tool()
 def get_run_stats(run_id: str, env: str | None = None) -> dict:
-    """Get step-level statistics for a Dagster run (timing, materialization counts, expectations)."""
+    """Get per-step execution statistics for a run: timing, materializations, and expectations.
+
+    Returns runId, status, and a stepStats array where each entry has:
+    stepKey, status, startTime, endTime, materializations (with labels),
+    and expectationResults (with success flag and labels).
+
+    When to use: to find slow steps (compare startTime/endTime), check which
+    steps materialized assets, or verify expectation results.
+    For failed runs, prefer get_run_failure_summary which includes step stats
+    alongside error details and suggestions.
+    """
     query = """
     query RunStats($runId: ID!) {
       runOrError(runId: $runId) {
@@ -468,10 +519,24 @@ def get_run_stats(run_id: str, env: str | None = None) -> dict:
 
 @mcp.tool()
 def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
-    """Get a consolidated failure summary for a Dagster run: failed steps with
-    root-cause errors, per-step durations, and diagnostic suggestions.
+    """Get a consolidated failure diagnosis for a run in a single call.
 
-    Much faster than calling get_run_status + get_run_logs + get_run_stats separately.
+    This is the BEST tool to use when investigating a failed or canceled run.
+    It combines status, step stats, and error logs into one response, avoiding
+    the need to call get_run_status + get_run_logs + get_run_stats separately.
+
+    Returns:
+    - status, job_name, duration_seconds
+    - failed_steps: list of {step_key, duration, error} for each failed step
+    - root_cause_error: the RunFailureEvent error (if any)
+    - all_step_durations: timing for every step (not just failed ones)
+    - suggestions: automated diagnostic hints (e.g. 'Multiple steps failed',
+      'Step was retried before failing', 'Run was canceled')
+
+    If the run did not fail, returns {message: 'Run did not fail.'}.
+
+    When to use: always prefer this over get_run_logs for failed runs.
+    Use get_run_logs only when you need the full event stream.
     """
     # 1. Fetch run status + step stats in one query
     status_query = """
@@ -628,7 +693,19 @@ def get_recent_materializations(
     limit: int = 5,
     env: str | None = None,
 ) -> list[dict]:
-    """Get the most recent materializations for a given asset key (e.g. 'my_daily_report')."""
+    """Get the most recent materializations for an asset, with metadata.
+
+    Returns a list of materializations, each with: runId, timestamp,
+    assetKey, and metadataEntries (labels, numeric values, text).
+
+    - asset_key: the asset name as a string (e.g. 'my_daily_report')
+    - limit: max materializations to return (default 5)
+
+    When to use: to check when an asset was last materialized, track
+    materialization frequency, or inspect metadata from recent runs.
+    For a broader health view (including staleness and freshness),
+    use get_asset_health instead.
+    """
     query = """
     query AssetRuns($assetKey: AssetKeyInput!, $limit: Int!) {
       assetOrError(assetKey: $assetKey) {
@@ -655,7 +732,19 @@ def get_recent_materializations(
 
 @mcp.tool()
 def get_asset_details(asset_keys: list[str], env: str | None = None) -> list[dict]:
-    """Get details for a list of asset keys: description, dependencies, group, latest materialization."""
+    """Get detailed metadata for one or more assets: description, lineage, and partitions.
+
+    - asset_keys: list of asset name strings (e.g. ['my_extract', 'my_load'])
+
+    Returns per asset: assetKey, description, groupName, op name,
+    isObservable, isPartitioned, partitionDefinition, dependencyKeys
+    (upstream assets), dependedByKeys (downstream assets), and the
+    latest materialization (runId + timestamp).
+
+    When to use: to understand an asset's lineage (what it depends on
+    and what depends on it), check if it's partitioned, or get its
+    description. Use search_assets first if you don't know the exact key.
+    """
     query = """
     query AssetDetails($assetKeys: [AssetKeyInput!]!) {
       assetNodes(assetKeys: $assetKeys) {
@@ -686,7 +775,19 @@ def search_assets(
     group: str | None = None,
     env: str | None = None,
 ) -> list[dict]:
-    """Search/list all asset nodes. Optionally filter by key prefix or group name (client-side)."""
+    """Search and list assets by name prefix or group. Use this to discover assets.
+
+    Returns per asset: assetKey, groupName, description, isPartitioned, op name.
+
+    - prefix: case-insensitive substring match on any part of the asset key
+      (e.g. 'raw_' finds 'raw_orders', 'raw_users')
+    - group: exact match on groupName (case-insensitive, e.g. 'analytics')
+    - Both filters can be combined.
+    - If neither is passed, returns ALL assets.
+
+    When to use: to discover available assets before calling get_asset_details
+    or get_asset_health. Use prefix for fuzzy search, group for scoped listing.
+    """
     query = """
     query AllAssets {
       assetNodes {
@@ -711,10 +812,24 @@ def search_assets(
 
 @mcp.tool()
 def get_asset_health(asset_key_or_group: str, env: str | None = None) -> list[dict]:
-    """Get a consolidated health view for an asset key or all assets in a group.
+    """Get a consolidated health view for a single asset or all assets in a group.
 
-    Returns per-asset: last materialization, latest run status, freshness policy,
-    staleness info. Pass a single asset key or a group name.
+    This is the BEST tool to assess whether assets are healthy and up-to-date.
+
+    - asset_key_or_group: pass either a single asset key (e.g. 'my_report')
+      or a group name (e.g. 'analytics'). If it matches a group, returns
+      health for ALL assets in that group.
+
+    Returns per asset:
+    - asset_key, group, description
+    - last_materialization: {run_id, timestamp, status} of the latest run
+    - freshness_policy: {maximum_lag_minutes, cron_schedule} if defined
+    - staleness: {is_stale, reasons[]} explaining why the asset is stale
+
+    When to use: to check if critical assets are fresh, find stale assets
+    in a group, or verify that recent materializations succeeded.
+    Prefer this over get_recent_materializations when you need a health
+    assessment rather than raw materialization history.
     """
     # First try as a group — fetch all assets and filter
     all_query = """
@@ -819,7 +934,13 @@ def get_asset_health(asset_key_or_group: str, env: str | None = None) -> list[di
 
 @mcp.tool()
 def list_jobs(env: str | None = None) -> list[dict]:
-    """List all jobs/pipelines available in the Dagster instance."""
+    """List all jobs across all code locations. Use this to discover available jobs.
+
+    Returns per job: repository name, code location name, job name, and description.
+
+    When to use: as a starting point to explore what jobs exist, or to find the
+    exact job name and repository_location needed for launch_job.
+    """
     query = """
     query ListJobs {
       repositoriesOrError {
@@ -853,7 +974,16 @@ def list_jobs(env: str | None = None) -> list[dict]:
 
 @mcp.tool()
 def list_schedules(env: str | None = None) -> list[dict]:
-    """List all schedules with their status, cron interval, and next tick."""
+    """List all schedules with their status, cron expression, target job, and next tick.
+
+    Returns per schedule: name, cron expression, status (RUNNING/STOPPED),
+    next_tick timestamp, target job name, repository, and code location.
+
+    When to use: to check which schedules are active, verify cron timing,
+    or find schedules that are stopped and might need attention.
+    If a schedule is RUNNING but jobs aren't executing, use
+    get_tick_history to inspect recent ticks for errors.
+    """
     query = """
     query ListSchedules {
       repositoriesOrError {
@@ -894,7 +1024,15 @@ def list_schedules(env: str | None = None) -> list[dict]:
 
 @mcp.tool()
 def list_sensors(env: str | None = None) -> list[dict]:
-    """List all sensors with their status and target jobs."""
+    """List all sensors with their status and target jobs.
+
+    Returns per sensor: name, status (RUNNING/STOPPED), list of target job names,
+    repository, and code location.
+
+    When to use: to check which sensors are active and what jobs they trigger.
+    If a sensor is RUNNING but not producing runs, use get_tick_history to
+    inspect recent ticks — it will show skipped ticks, errors, or runs launched.
+    """
     query = """
     query ListSensors {
       repositoriesOrError {
@@ -936,10 +1074,21 @@ def get_tick_history(
     limit: int = 20,
     env: str | None = None,
 ) -> dict:
-    """Get recent tick history for a schedule or sensor. Useful for detecting
-    silent failures in sensors or missed schedule ticks.
+    """Get recent tick history for a schedule or sensor — essential for detecting silent failures.
 
-    instigator_type must be 'SCHEDULE' or 'SENSOR'.
+    - instigator_name: exact name of the schedule or sensor (from list_schedules/list_sensors)
+    - instigator_type: 'SCHEDULE' or 'SENSOR'
+    - limit: max ticks to return (default 20)
+
+    Returns per tick: tick_id, status (SUCCESS/FAILURE/SKIPPED), timestamp,
+    error message (if failed), and run_ids (runs launched by this tick).
+
+    When to use: when a schedule or sensor is RUNNING but data is not being
+    produced. Common patterns to look for:
+    - All ticks SKIPPED: sensor condition not met, or misconfigured
+    - Ticks with FAILURE status: the schedule/sensor code is erroring
+    - Ticks with SUCCESS but empty run_ids: sensor evaluated but decided not to launch
+    - Missing ticks: daemon may be unhealthy (check get_instance_status)
     """
     instigator_type = instigator_type.upper()
     if instigator_type not in ("SCHEDULE", "SENSOR"):
@@ -998,7 +1147,15 @@ def get_tick_history(
 
 @mcp.tool()
 def list_code_locations(env: str | None = None) -> list[dict]:
-    """List all code locations (repository locations) and their load status."""
+    """List all code locations and their load status.
+
+    Returns per location: name, loadStatus (LOADED/LOADING), and either the
+    repositories within it or a PythonError if loading failed.
+
+    When to use: after a deployment to verify code locations loaded correctly,
+    or when get_instance_status reports code location errors.
+    If a location failed to load, use reload_code_location to retry.
+    """
     query = """
     query CodeLocations {
       workspaceOrError {
@@ -1025,8 +1182,21 @@ def list_code_locations(env: str | None = None) -> list[dict]:
 
 @mcp.tool()
 def get_instance_status(env: str | None = None) -> dict:
-    """Get a global health check of the Dagster instance: daemon health, queued run count,
-    and code location errors. Use this as a first call to understand if the instance is healthy."""
+    """Get a global health check of the Dagster instance. START HERE for any monitoring workflow.
+
+    Returns:
+    - healthy: boolean — true only if all required daemons are healthy AND
+      no code locations have errors
+    - daemons: list of {type, healthy, last_heartbeat, required} for each daemon
+      (scheduler, sensor, run coordinator, etc.)
+    - queued_runs_count: number of runs waiting in queue (high count = bottleneck)
+    - code_location_errors: list of {name, error} for locations that failed to load
+
+    When to use: as the FIRST call in any diagnostic or monitoring flow.
+    If healthy=false, check daemons for unhealthy entries and
+    code_location_errors for loading failures.
+    Follow up with list_code_locations or get_runs as needed.
+    """
     query = """
     query InstanceStatus {
       instance {
@@ -1105,7 +1275,17 @@ def get_instance_status(env: str | None = None) -> dict:
 
 
 def reload_code_location(location_name: str, env: str | None = None) -> dict:
-    """Reload a code location by name (e.g. after a deploy). Returns the new load status."""
+    """Reload a code location to pick up new code (e.g. after a deploy).
+
+    - location_name: exact name of the code location (from list_code_locations)
+
+    Returns the new load status. If the location is not found or reload
+    is not supported, returns an error message.
+
+    When to use: after deploying new code, or when list_code_locations shows
+    a location in an error state. This is equivalent to clicking 'Reload'
+    in the Dagster UI.
+    """
     query = """
     mutation ReloadLocation($location: String!) {
       reloadRepositoryLocation(repositoryLocationName: $location) {
@@ -1132,7 +1312,15 @@ def reload_code_location(location_name: str, env: str | None = None) -> dict:
 
 @mcp.tool()
 def list_backfills(limit: int = 10, env: str | None = None) -> list[dict]:
-    """List recent backfills with their status and progress."""
+    """List recent asset backfills with their status and partition progress.
+
+    Returns per backfill: backfillId, status, numPartitions, timestamp,
+    partitionNames, and partitionSetName.
+
+    - limit: max backfills to return (default 10)
+
+    When to use: to monitor in-progress backfills or review recent ones.
+    """
     query = """
     query Backfills($limit: Int!, $cursor: String) {
       partitionBackfillsOrError(cursor: $cursor, limit: $limit) {
@@ -1158,7 +1346,16 @@ def list_backfills(limit: int = 10, env: str | None = None) -> list[dict]:
 
 
 def terminate_run(run_id: str, env: str | None = None) -> dict:
-    """Terminate/stop a running Dagster run by run ID."""
+    """Terminate a running or queued Dagster run.
+
+    - run_id: the runId to terminate (get it from get_runs)
+
+    Returns the run's final status on success, or an error message if the
+    run was not found or could not be terminated.
+
+    When to use: to stop a stuck, hung, or runaway run. Only works on runs
+    with status STARTED or QUEUED. Already-finished runs cannot be terminated.
+    """
     query = """
     mutation TerminateRun($runId: String!) {
       terminateRun(runId: $runId) {
@@ -1181,11 +1378,26 @@ def launch_job(
     tags: dict[str, str] | None = None,
     env: str | None = None,
 ) -> dict:
-    """Launch a Dagster job or materialize specific assets.
+    """Launch a job or materialize specific assets. Use list_jobs first to find valid names.
 
-    For asset materialization, pass asset_keys with the job that targets them
-    (often '__ASSET_JOB' or a custom asset job name).
-    Example asset_keys: ['my_extract_asset', 'my_load_asset']
+    Required parameters:
+    - job_name: name of the job (from list_jobs, e.g. 'my_etl_job')
+    - repository_location: code location name (from list_jobs, e.g. 'my_project')
+    - repository_name: defaults to '__repository__', override if you have
+      multiple repositories in a single code location
+
+    Optional parameters:
+    - asset_keys: list of asset key strings to materialize. Use this with the
+      job that targets them (often '__ASSET_JOB' or a custom asset job name).
+      Example: ['raw_orders', 'clean_orders']
+    - tags: dict of key-value tags to attach to the run.
+      Example: {'triggered_by': 'dataops_agent', 'priority': 'high'}
+
+    Returns the launched run's runId and status on success, or an error message.
+
+    When to use: to re-run a failed job, trigger an ad-hoc materialization,
+    or launch a job with custom tags for tracking. After launching, use
+    get_run_status or get_runs to monitor progress.
     """
     execution_metadata: dict = {}
     if tags:
