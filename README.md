@@ -10,8 +10,6 @@ An [MCP](https://modelcontextprotocol.io/) server that gives AI agents full visi
 
 Works with any MCP client: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Claude Desktop](https://claude.ai), [Cursor](https://cursor.sh), and more.
 
-![Demo — AI agent monitors, diagnoses, and fixes a Dagster pipeline](demo.gif)
-
 ## Why this exists
 
 Data pipelines break at 3 AM. Schedules silently stop firing. Assets go stale. Instead of waking up to a dashboard full of red, give your AI agent the tools to **monitor, diagnose, and fix** your Dagster instance autonomously.
