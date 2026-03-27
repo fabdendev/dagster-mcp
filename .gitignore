@@ -15,3 +15,6 @@ wheels/
 
 # Secrets
 .env
+
+# VHS tape (build script for demo.gif)
+demo.tape
