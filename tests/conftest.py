@@ -4,6 +4,8 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+from dagster_mcp import server as _server_mod
+
 
 @pytest.fixture(autouse=True)
 def env_defaults(monkeypatch):
@@ -13,6 +15,8 @@ def env_defaults(monkeypatch):
     monkeypatch.delenv("DAGSTER_API_TOKEN", raising=False)
     monkeypatch.delenv("DAGSTER_EXTRA_HEADERS", raising=False)
     monkeypatch.setenv("DAGSTER_READ_ONLY", "true")
+    # Clear introspection cache between tests
+    _server_mod._runs_filter_job_field.clear()
 
 
 @pytest.fixture

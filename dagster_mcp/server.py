@@ -124,6 +124,49 @@ def _build_headers(
     return headers
 
 
+# ---------------------------------------------------------------------------
+# RunsFilter introspection — detect whether the instance uses "jobName" or
+# "pipelineName" as the filter field (varies across Dagster versions).
+# ---------------------------------------------------------------------------
+
+_runs_filter_job_field: dict[str, str] = {}  # graphql_url -> field name
+
+_INTROSPECTION_QUERY = '{ __type(name: "RunsFilter") { inputFields { name } } }'
+
+
+def _get_runs_filter_job_field(env: str | None = None) -> str:
+    """Return the correct RunsFilter field name for job filtering."""
+    graphql_url, api_token, extra_headers_json = _resolve_connection(env)
+
+    if graphql_url in _runs_filter_job_field:
+        return _runs_filter_job_field[graphql_url]
+
+    try:
+        headers = _build_headers(api_token, extra_headers_json)
+        response = httpx.post(
+            graphql_url,
+            json={"query": _INTROSPECTION_QUERY},
+            headers=headers,
+            timeout=30,
+        )
+        data = response.json()
+        fields = {
+            f["name"]
+            for f in data.get("data", {}).get("__type", {}).get("inputFields", [])
+        }
+        if "jobName" in fields:
+            field = "jobName"
+        elif "pipelineName" in fields:
+            field = "pipelineName"
+        else:
+            field = "jobName"
+    except Exception:
+        field = "jobName"
+
+    _runs_filter_job_field[graphql_url] = field
+    return field
+
+
 def gql(query: str, variables: dict | None = None, env: str | None = None) -> dict:
     graphql_url, api_token, extra_headers_json = _resolve_connection(env)
     headers = _build_headers(api_token, extra_headers_json)
@@ -191,7 +234,8 @@ def get_runs(
     if statuses:
         filter_var["statuses"] = statuses
     if job_name:
-        filter_var["jobName"] = job_name
+        field = _get_runs_filter_job_field(env)
+        filter_var[field] = job_name
     data = gql(query, {"limit": limit, "filter": filter_var or None}, env=env)
     runs = data.get("runsOrError", {})
     return runs.get("results", [])

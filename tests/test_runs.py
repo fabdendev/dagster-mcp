@@ -5,7 +5,16 @@ import httpx
 
 from dagster_mcp.server import (
     get_runs, get_run_status, get_run_logs, get_run_stats, get_run_failure_summary,
+    _runs_filter_job_field,
 )
+
+
+def _mock_response(data, status_code=200):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = data
+    resp.text = json.dumps(data)
+    return resp
 
 
 class TestGetRuns:
@@ -18,11 +27,56 @@ class TestGetRuns:
         assert len(result) == 1
         assert result[0]["runId"] == "r1"
 
-    def test_with_job_name(self, mock_gql):
-        mock_post = mock_gql({"data": {"runsOrError": {"results": []}}})
+    def test_with_job_name(self, monkeypatch):
+        mock_post = MagicMock(side_effect=[
+            # 1st call: introspection
+            _mock_response({"data": {"__type": {"inputFields": [
+                {"name": "jobName"}, {"name": "statuses"}, {"name": "runIds"},
+            ]}}}),
+            # 2nd call: actual get_runs query
+            _mock_response({"data": {"runsOrError": {"results": []}}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
         get_runs(job_name="my_job")
-        payload = mock_post.call_args.kwargs["json"]
-        assert payload["variables"]["filter"]["jobName"] == "my_job"
+        query_payload = mock_post.call_args_list[1].kwargs["json"]
+        assert query_payload["variables"]["filter"]["jobName"] == "my_job"
+
+    def test_with_job_name_pipeline_field(self, monkeypatch):
+        """On older/newer Dagster versions the field is pipelineName."""
+        mock_post = MagicMock(side_effect=[
+            _mock_response({"data": {"__type": {"inputFields": [
+                {"name": "pipelineName"}, {"name": "statuses"},
+            ]}}}),
+            _mock_response({"data": {"runsOrError": {"results": []}}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        get_runs(job_name="my_job")
+        query_payload = mock_post.call_args_list[1].kwargs["json"]
+        assert query_payload["variables"]["filter"]["pipelineName"] == "my_job"
+
+    def test_introspection_cached(self, monkeypatch):
+        """Introspection should only happen once per URL."""
+        mock_post = MagicMock(side_effect=[
+            _mock_response({"data": {"__type": {"inputFields": [{"name": "jobName"}]}}}),
+            _mock_response({"data": {"runsOrError": {"results": []}}}),
+            # 2nd get_runs call — no introspection, just the query
+            _mock_response({"data": {"runsOrError": {"results": []}}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        get_runs(job_name="a")
+        get_runs(job_name="b")
+        assert mock_post.call_count == 3  # 1 introspection + 2 queries
+
+    def test_introspection_fallback_on_error(self, monkeypatch):
+        """If introspection fails, fall back to jobName."""
+        mock_post = MagicMock(side_effect=[
+            Exception("connection refused"),
+            _mock_response({"data": {"runsOrError": {"results": []}}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        get_runs(job_name="my_job")
+        query_payload = mock_post.call_args_list[1].kwargs["json"]
+        assert query_payload["variables"]["filter"]["jobName"] == "my_job"
 
     def test_with_statuses(self, mock_gql):
         mock_post = mock_gql({"data": {"runsOrError": {"results": []}}})
