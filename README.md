@@ -208,14 +208,14 @@ They serve different purposes and work well together.
 
 ## Compatibility
 
-Tested with Dagster 1.6+. All GraphQL queries target stable, non-deprecated API fields.
+Tested with Dagster 1.6+. The `RunsFilter` field name (`jobName` vs `pipelineName`) is auto-detected via schema introspection, so the server works across all Dagster versions without configuration.
 
 ## Development
 
 ```bash
 uv sync --extra dev
 uv run ruff check dagster_mcp/    # lint
-uv run pytest                     # tests (95 tests)
+uv run pytest                     # tests (98 tests)
 uv run python -m dagster_mcp      # start server locally
 ```
 
