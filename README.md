@@ -1,7 +1,7 @@
 # Dagster MCP
 
 [![PyPI version](https://img.shields.io/pypi/v/dagster-mcp)](https://pypi.org/project/dagster-mcp/)
-[![PyPI downloads](https://img.shields.io/pypi/dm/dagster-mcp)](https://pypi.org/project/dagster-mcp/)
+[![Downloads](https://static.pepy.tech/badge/dagster-mcp/month)](https://pepy.tech/project/dagster-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Tests](https://github.com/fabdendev/dagster-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/fabdendev/dagster-mcp/actions/workflows/tests.yml)
