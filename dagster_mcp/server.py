@@ -35,9 +35,7 @@ _ENVS: dict[str, dict] = _parse_dagster_envs(_DAGSTER_ENVS_RAW)
 
 _mode = "read-only" if READ_ONLY else "read-write"
 _env_info = (
-    f"Available environments: {', '.join(_ENVS)}. Pass env=<name> to each tool. "
-    if _ENVS
-    else ""
+    f"Available environments: {', '.join(_ENVS)}. Pass env=<name> to each tool. " if _ENVS else ""
 )
 mcp = FastMCP(
     "dagster",
@@ -75,9 +73,7 @@ def _resolve_connection(env: str | None) -> tuple[str, str, str]:
             )
 
     if name not in _ENVS:
-        raise RuntimeError(
-            f"Unknown Dagster env '{name}'. Available: {', '.join(_ENVS)}."
-        )
+        raise RuntimeError(f"Unknown Dagster env '{name}'. Available: {', '.join(_ENVS)}.")
 
     cfg = _ENVS[name]
     url = cfg.get("url", "http://localhost:3000")
@@ -104,7 +100,7 @@ def _build_headers(
         except json.JSONDecodeError as exc:
             raise RuntimeError(
                 "DAGSTER_EXTRA_HEADERS must be a valid JSON object "
-                "(example: '{\"Authorization\":\"Bearer token\"}')."
+                '(example: \'{"Authorization":"Bearer token"}\').'
             ) from exc
 
         if not isinstance(extra_headers, dict):
@@ -116,9 +112,7 @@ def _build_headers(
             if not isinstance(key, str) or not isinstance(value, str)
         ]
         if invalid_pairs:
-            raise RuntimeError(
-                "DAGSTER_EXTRA_HEADERS keys and values must be strings."
-            )
+            raise RuntimeError("DAGSTER_EXTRA_HEADERS keys and values must be strings.")
 
         headers.update(extra_headers)
     return headers
@@ -150,10 +144,7 @@ def _get_runs_filter_job_field(env: str | None = None) -> str:
             timeout=30,
         )
         data = response.json()
-        fields = {
-            f["name"]
-            for f in data.get("data", {}).get("__type", {}).get("inputFields", [])
-        }
+        fields = {f["name"] for f in data.get("data", {}).get("__type", {}).get("inputFields", [])}
         if "jobName" in fields:
             field = "jobName"
         elif "pipelineName" in fields:
@@ -185,13 +176,9 @@ def gql(query: str, variables: dict | None = None, env: str | None = None) -> di
         )
     except httpx.TimeoutException:
         base_url = graphql_url.removesuffix("/graphql")
-        raise RuntimeError(
-            f"Request to Dagster at {base_url} timed out after 30s."
-        )
+        raise RuntimeError(f"Request to Dagster at {base_url} timed out after 30s.")
     if response.status_code >= 400:
-        raise RuntimeError(
-            f"Dagster returned HTTP {response.status_code}: {response.text[:500]}"
-        )
+        raise RuntimeError(f"Dagster returned HTTP {response.status_code}: {response.text[:500]}")
     data = response.json()
     if "errors" in data:
         messages = [e.get("message", str(e)) for e in data["errors"]]
@@ -472,9 +459,9 @@ def get_run_logs(
         upper = level_filter.upper()
         error_types = ("ExecutionStepFailureEvent", "RunFailureEvent")
         result["events"] = [
-            e for e in result["events"]
-            if e.get("level") == upper
-            or (upper == "ERROR" and e.get("__typename") in error_types)
+            e
+            for e in result["events"]
+            if e.get("level") == upper or (upper == "ERROR" and e.get("__typename") in error_types)
         ]
 
     return result
@@ -602,11 +589,15 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
           }
         }
         """
-        log_data = gql(log_query, {"runId": run_id, "afterCursor": cursor}, env=env).get("logsForRun", {})
+        log_data = gql(log_query, {"runId": run_id, "afterCursor": cursor}, env=env).get(
+            "logsForRun", {}
+        )
         events = log_data.get("events", [])
         for e in events:
             if e.get("__typename") in (
-                "ExecutionStepFailureEvent", "RunFailureEvent", "ExecutionStepUpForRetryEvent"
+                "ExecutionStepFailureEvent",
+                "RunFailureEvent",
+                "ExecutionStepUpForRetryEvent",
             ):
                 error_events.append(e)
         if not log_data.get("hasMore"):
@@ -620,11 +611,13 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
         dur = None
         if s.get("startTime") and s.get("endTime"):
             dur = round(s["endTime"] - s["startTime"], 2)
-        all_step_durations.append({
-            "step_key": s["stepKey"],
-            "status": s["status"],
-            "duration_seconds": dur,
-        })
+        all_step_durations.append(
+            {
+                "step_key": s["stepKey"],
+                "status": s["status"],
+                "duration_seconds": dur,
+            }
+        )
 
     # 4. Build failed steps with errors
     failed_step_keys = {s["stepKey"] for s in step_stats if s["status"] == "FAILURE"}
@@ -640,11 +633,13 @@ def get_run_failure_summary(run_id: str, env: str | None = None) -> dict:
             dur = None
             if s.get("startTime") and s.get("endTime"):
                 dur = round(s["endTime"] - s["startTime"], 2)
-            failed_steps.append({
-                "step_key": s["stepKey"],
-                "duration_seconds": dur,
-                "error": step_errors.get(s["stepKey"], {}),
-            })
+            failed_steps.append(
+                {
+                    "step_key": s["stepKey"],
+                    "duration_seconds": dur,
+                    "error": step_errors.get(s["stepKey"], {}),
+                }
+            )
 
     # 5. Root cause error (run-level failure or first step failure)
     root_cause = None
@@ -916,15 +911,17 @@ def get_asset_health(asset_key_or_group: str, env: str | None = None) -> list[di
             }
 
         stale_causes = n.get("staleCauses", [])
-        results.append({
-            "asset_key": n["assetKey"]["path"],
-            "group": n.get("groupName"),
-            "last_materialization": last_mat,
-            "latest_run_status": latest_run_status,
-            "freshness_policy": freshness_policy,
-            "stale": len(stale_causes) > 0,
-            "stale_causes": [c.get("reason", "") for c in stale_causes],
-        })
+        results.append(
+            {
+                "asset_key": n["assetKey"]["path"],
+                "group": n.get("groupName"),
+                "last_materialization": last_mat,
+                "latest_run_status": latest_run_status,
+                "freshness_policy": freshness_policy,
+                "stale": len(stale_causes) > 0,
+                "stale_causes": [c.get("reason", "") for c in stale_causes],
+            }
+        )
 
     return results
 
@@ -963,12 +960,14 @@ def list_jobs(env: str | None = None) -> list[dict]:
     result = []
     for repo in repos:
         for job in repo.get("jobs", []):
-            result.append({
-                "repository": repo["name"],
-                "location": repo["location"]["name"],
-                "job": job["name"],
-                "description": job.get("description", ""),
-            })
+            result.append(
+                {
+                    "repository": repo["name"],
+                    "location": repo["location"]["name"],
+                    "job": job["name"],
+                    "description": job.get("description", ""),
+                }
+            )
     return result
 
 
@@ -1010,15 +1009,17 @@ def list_schedules(env: str | None = None) -> list[dict]:
     for repo in repos:
         for sched in repo.get("schedules", []):
             next_ticks = sched.get("futureTicks", {}).get("results", [])
-            result.append({
-                "repository": repo["name"],
-                "location": repo["location"]["name"],
-                "schedule": sched["name"],
-                "cron": sched.get("cronSchedule"),
-                "status": sched.get("scheduleState", {}).get("status"),
-                "next_tick": next_ticks[0]["timestamp"] if next_ticks else None,
-                "job": sched.get("pipelineName"),
-            })
+            result.append(
+                {
+                    "repository": repo["name"],
+                    "location": repo["location"]["name"],
+                    "schedule": sched["name"],
+                    "cron": sched.get("cronSchedule"),
+                    "status": sched.get("scheduleState", {}).get("status"),
+                    "next_tick": next_ticks[0]["timestamp"] if next_ticks else None,
+                    "job": sched.get("pipelineName"),
+                }
+            )
     return result
 
 
@@ -1057,13 +1058,15 @@ def list_sensors(env: str | None = None) -> list[dict]:
     for repo in repos:
         for sensor in repo.get("sensors", []):
             targets = [t["pipelineName"] for t in sensor.get("targets", [])]
-            result.append({
-                "repository": repo["name"],
-                "location": repo["location"]["name"],
-                "sensor": sensor["name"],
-                "status": sensor.get("sensorState", {}).get("status"),
-                "targets": targets,
-            })
+            result.append(
+                {
+                    "repository": repo["name"],
+                    "location": repo["location"]["name"],
+                    "sensor": sensor["name"],
+                    "status": sensor.get("sensorState", {}).get("status"),
+                    "targets": targets,
+                }
+            )
     return result
 
 
@@ -1138,8 +1141,11 @@ def get_tick_history(
                 ],
             }
 
-    return {"name": instigator_name, "instigator_type": instigator_type,
-            "message": f"{instigator_type.capitalize()} '{instigator_name}' not found."}
+    return {
+        "name": instigator_name,
+        "instigator_type": instigator_type,
+        "message": f"{instigator_type.capitalize()} '{instigator_name}' not found.",
+    }
 
 
 # ── Code Locations ────────────────────────────────────────────────────────────
@@ -1231,11 +1237,7 @@ def get_instance_status(env: str | None = None) -> dict:
     data = gql(query, env=env)
 
     # Daemons
-    daemon_statuses = (
-        data.get("instance", {})
-        .get("daemonHealth", {})
-        .get("allDaemonStatuses", [])
-    )
+    daemon_statuses = data.get("instance", {}).get("daemonHealth", {}).get("allDaemonStatuses", [])
     daemons = [
         {
             "type": d["daemonType"],
@@ -1252,18 +1254,14 @@ def get_instance_status(env: str | None = None) -> dict:
     queued_count = len(queued_runs)
 
     # Code location errors
-    location_entries = (
-        data.get("workspaceOrError", {}).get("locationEntries", [])
-    )
+    location_entries = data.get("workspaceOrError", {}).get("locationEntries", [])
     code_location_errors = []
     for loc in location_entries:
         err = loc.get("locationOrLoadError", {})
         if "message" in err:
             code_location_errors.append({"name": loc["name"], "error": err["message"]})
 
-    all_required_healthy = all(
-        d["healthy"] for d in daemons if d["required"]
-    )
+    all_required_healthy = all(d["healthy"] for d in daemons if d["required"])
     healthy = all_required_healthy and len(code_location_errors) == 0
 
     return {
@@ -1401,9 +1399,7 @@ def launch_job(
     """
     execution_metadata: dict = {}
     if tags:
-        execution_metadata["tags"] = [
-            {"key": k, "value": v} for k, v in tags.items()
-        ]
+        execution_metadata["tags"] = [{"key": k, "value": v} for k, v in tags.items()]
 
     solid_selection: list[str] | None = None
     if asset_keys:
@@ -1495,8 +1491,6 @@ def launch_job_with_partitions(
         ... on PipelineNotFoundError { message }
         ... on PythonError { message }
         ... on UnauthorizedError { message }
-        ... on InvalidStepError { message }
-        ... on InvalidOutputError { message }
         ... on RunConfigValidationInvalid { errors { message } }
       }
     }
