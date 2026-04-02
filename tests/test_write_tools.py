@@ -1,4 +1,4 @@
-from dagster_mcp.server import launch_job, terminate_run, reload_code_location
+from dagster_mcp.server import launch_job, launch_job_with_partitions, terminate_run, reload_code_location
 
 
 class TestTerminateRun:
@@ -59,6 +59,76 @@ class TestLaunchJob:
         assert meta["tags"] == [{"key": "env", "value": "prod"}]
 
 
+class TestLaunchJobWithPartitions:
+    def test_single_partition(self, mock_gql):
+        mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}})
+        result = launch_job_with_partitions("daily_job", "loc1", ["2024-01-01"])
+        assert result["backfillId"] == "bf1"
+
+    def test_multiple_partitions(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf2"}}})
+        launch_job_with_partitions("daily_job", "loc1", ["2024-01-01", "2024-01-02"])
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"]["backfillParams"]["partitionNames"] == [
+            "2024-01-01", "2024-01-02"
+        ]
+
+    def test_default_partition_set_name(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf3"}}})
+        launch_job_with_partitions("daily_job", "loc1", ["2024-01-01"])
+        payload = mock_post.call_args.kwargs["json"]
+        selector = payload["variables"]["backfillParams"]["selector"]
+        assert selector["partitionSetName"] == "daily_job_partition_set"
+
+    def test_custom_partition_set_name(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf4"}}})
+        launch_job_with_partitions(
+            "daily_job", "loc1", ["2024-01-01"],
+            partition_set_name="custom_partition_set",
+        )
+        payload = mock_post.call_args.kwargs["json"]
+        selector = payload["variables"]["backfillParams"]["selector"]
+        assert selector["partitionSetName"] == "custom_partition_set"
+
+    def test_repository_selector(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf5"}}})
+        launch_job_with_partitions(
+            "daily_job", "my_location", ["2024-01-01"],
+            repository_name="my_repo",
+        )
+        payload = mock_post.call_args.kwargs["json"]
+        repo_selector = payload["variables"]["backfillParams"]["selector"]["repositorySelector"]
+        assert repo_selector["repositoryLocationName"] == "my_location"
+        assert repo_selector["repositoryName"] == "my_repo"
+
+    def test_with_tags(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf6"}}})
+        launch_job_with_partitions(
+            "daily_job", "loc1", ["2024-01-01"],
+            tags={"triggered_by": "agent"},
+        )
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"]["backfillParams"]["tags"] == [
+            {"key": "triggered_by", "value": "agent"}
+        ]
+
+    def test_from_failure(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf7"}}})
+        launch_job_with_partitions(
+            "daily_job", "loc1", ["2024-01-01"],
+            from_failure=True,
+        )
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"]["backfillParams"]["fromFailure"] is True
+
+    def test_partition_set_not_found(self, mock_gql):
+        mock_gql({"data": {"launchPartitionBackfill": {
+            "message": "Partition set not found"
+        }}})
+        result = launch_job_with_partitions("bad_job", "loc1", ["2024-01-01"])
+        assert "message" in result
+
+
 class TestReadOnlyGating:
     def test_write_tools_not_registered_in_readonly(self):
         import asyncio
@@ -69,3 +139,4 @@ class TestReadOnlyGating:
             assert "reload_code_location" not in tool_names
             assert "terminate_run" not in tool_names
             assert "launch_job" not in tool_names
+            assert "launch_job_with_partitions" not in tool_names

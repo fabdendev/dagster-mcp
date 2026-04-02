@@ -1447,12 +1447,85 @@ def launch_job(
     return data.get("launchRun", {})
 
 
+def launch_job_with_partitions(
+    job_name: str,
+    repository_location: str,
+    partition_keys: list[str],
+    repository_name: str = "__repository__",
+    partition_set_name: str | None = None,
+    tags: dict[str, str] | None = None,
+    from_failure: bool = False,
+    env: str | None = None,
+) -> dict:
+    """Launch a partitioned job for one or more partition keys.
+
+    Use list_jobs to find job names. Use get_asset_details to check if an asset
+    is partitioned (isPartitioned field) and what partition definition it uses.
+
+    Required parameters:
+    - job_name: name of the partitioned job (from list_jobs)
+    - repository_location: code location name (from list_jobs)
+    - partition_keys: one or more partition key strings to run.
+      Examples: ['2024-01-01'], ['2024-01-01', '2024-01-02', '2024-01-03']
+
+    Optional parameters:
+    - repository_name: defaults to '__repository__', override if you have
+      multiple repositories in a single code location
+    - partition_set_name: partition set name; defaults to '{job_name}_partition_set'.
+      Override this if the job uses a non-standard partition set name.
+    - tags: additional key-value tags to attach to the launched runs.
+      Example: {'triggered_by': 'dataops_agent'}
+    - from_failure: if True, only re-run the failed steps within the given
+      partitions (useful for retrying partially-failed partitioned runs)
+
+    Returns backfillId on success — even for a single partition, Dagster creates
+    a backfill record. Use list_backfills to monitor progress.
+
+    When to use: to run a job for a specific date/partition, backfill historical
+    partitions, or retry failed partitions. For non-partitioned jobs, use launch_job.
+    """
+    resolved_partition_set = partition_set_name or f"{job_name}_partition_set"
+    tag_list = [{"key": k, "value": v} for k, v in tags.items()] if tags else []
+
+    query = """
+    mutation LaunchPartitionBackfill($backfillParams: LaunchBackfillParams!) {
+      launchPartitionBackfill(backfillParams: $backfillParams) {
+        ... on LaunchBackfillSuccess { backfillId }
+        ... on PartitionSetNotFoundError { message }
+        ... on PipelineNotFoundError { message }
+        ... on PythonError { message }
+        ... on UnauthorizedError { message }
+        ... on InvalidStepError { message }
+        ... on InvalidOutputError { message }
+        ... on RunConfigValidationInvalid { errors { message } }
+      }
+    }
+    """
+    variables = {
+        "backfillParams": {
+            "selector": {
+                "repositorySelector": {
+                    "repositoryLocationName": repository_location,
+                    "repositoryName": repository_name,
+                },
+                "partitionSetName": resolved_partition_set,
+            },
+            "partitionNames": partition_keys,
+            "tags": tag_list,
+            "fromFailure": from_failure,
+        }
+    }
+    data = gql(query, variables, env=env)
+    return data.get("launchPartitionBackfill", {})
+
+
 # ── Write tools (only registered when DAGSTER_READ_ONLY=false) ────────────────
 
 if not READ_ONLY:
     mcp.tool()(reload_code_location)
     mcp.tool()(terminate_run)
     mcp.tool()(launch_job)
+    mcp.tool()(launch_job_with_partitions)
 
 
 def main():
