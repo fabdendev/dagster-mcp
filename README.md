@@ -42,7 +42,7 @@ Agent: Re-launching the failed job...
 | **Jobs** | `list_jobs` | Inventory all jobs across code locations |
 | **Schedules & Sensors** | `list_schedules` `list_sensors` `get_tick_history` | Detect silent failures, missed ticks, sensor errors |
 | **Instance** | `get_instance_status` `list_code_locations` `list_backfills` | Global health check, daemon status, code location errors |
-| **Actions** | `launch_job` `terminate_run` `reload_code_location` | Re-run failed jobs, stop stuck runs, reload after deploy |
+| **Actions** | `launch_job` `launch_job_with_partitions` `terminate_run` `reload_code_location` | Re-run failed jobs, backfill partitions, stop stuck runs, reload after deploy |
 
 > Actions are opt-in: set `DAGSTER_READ_ONLY=false` to enable write operations.
 
@@ -253,6 +253,7 @@ Add to `claude_desktop_config.json`:
 | Tool | Description |
 |------|-------------|
 | `launch_job` | Launch a job or materialize specific assets (supports tags and asset selection) |
+| `launch_job_with_partitions` | Launch a partitioned job for one or more partition keys; creates a backfill (supports `from_failure` to retry only failed steps) |
 | `terminate_run` | Stop a stuck or runaway run |
 | `reload_code_location` | Reload a code location after deploy |
 
