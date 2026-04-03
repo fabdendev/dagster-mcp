@@ -1,19 +1,20 @@
-name: Auto Release
+name: Release & Publish
 
 on:
   push:
     branches: [main]
 
 jobs:
-  release:
+  release-and-publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Required to create releases and tags
+      contents: write   # Create releases and tags
+      id-token: write   # PyPI trusted publishing (OIDC)
 
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Full history for changelog generation
+          fetch-depth: 0
 
       - name: Get version from pyproject.toml
         id: version
@@ -31,7 +32,31 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create release
+      - name: Install uv
+        if: steps.check.outputs.exists == 'false'
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        if: steps.check.outputs.exists == 'false'
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        if: steps.check.outputs.exists == 'false'
+        run: uv sync --extra dev
+
+      - name: Lint
+        if: steps.check.outputs.exists == 'false'
+        run: uv run ruff check dagster_mcp/
+
+      - name: Test
+        if: steps.check.outputs.exists == 'false'
+        run: uv run pytest --tb=short
+
+      - name: Build
+        if: steps.check.outputs.exists == 'false'
+        run: uv build
+
+      - name: Create GitHub release
         if: steps.check.outputs.exists == 'false'
         run: |
           gh release create "${{ steps.version.outputs.tag }}" \
@@ -39,3 +64,7 @@ jobs:
             --generate-notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to PyPI
+        if: steps.check.outputs.exists == 'false'
+        uses: pypa/gh-action-pypi-publish@release/v1
