@@ -58,6 +58,23 @@ class TestLaunchJob:
         meta = payload["variables"]["executionMetadata"]
         assert meta["tags"] == [{"key": "env", "value": "prod"}]
 
+    def test_launch_with_run_config(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchRun": {
+            "run": {"runId": "r4", "status": "STARTING"},
+        }}})
+        config = {"ops": {"my_op": {"config": {"start_date": "2026-03-01"}}}}
+        launch_job("my_job", "loc1", "repo1", run_config=config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"]["runConfigData"] == config
+
+    def test_launch_without_run_config_sends_empty(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchRun": {
+            "run": {"runId": "r5", "status": "STARTING"},
+        }}})
+        launch_job("my_job", "loc1", "repo1")
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"]["runConfigData"] == {}
+
 
 class TestLaunchJobWithPartitions:
     def test_single_partition(self, mock_gql):

@@ -1374,6 +1374,7 @@ def launch_job(
     repository_name: str = "__repository__",
     asset_keys: list[str] | None = None,
     tags: dict[str, str] | None = None,
+    run_config: dict | None = None,
     env: str | None = None,
 ) -> dict:
     """Launch a job or materialize specific assets. Use list_jobs first to find valid names.
@@ -1390,11 +1391,14 @@ def launch_job(
       Example: ['raw_orders', 'clean_orders']
     - tags: dict of key-value tags to attach to the run.
       Example: {'triggered_by': 'dataops_agent', 'priority': 'high'}
+    - run_config: dict of run configuration to pass to the job. This is the
+      same YAML/dict you would enter in the Dagster UI Launchpad.
+      Example: {'ops': {'my_op': {'config': {'start_date': '2026-03-01'}}}}
 
     Returns the launched run's runId and status on success, or an error message.
 
     When to use: to re-run a failed job, trigger an ad-hoc materialization,
-    or launch a job with custom tags for tracking. After launching, use
+    or launch a job with custom config or tags. After launching, use
     get_run_status or get_runs to monitor progress.
     """
     execution_metadata: dict = {}
@@ -1411,7 +1415,8 @@ def launch_job(
       $repoName: String!,
       $jobName: String!,
       $solidSelection: [String!],
-      $executionMetadata: ExecutionMetadata
+      $executionMetadata: ExecutionMetadata,
+      $runConfigData: RunConfigData
     ) {
       launchRun(executionParams: {
         selector: {
@@ -1420,7 +1425,7 @@ def launch_job(
           jobName: $jobName,
           solidSelection: $solidSelection
         },
-        runConfigData: {},
+        runConfigData: $runConfigData,
         executionMetadata: $executionMetadata
       }) {
         ... on LaunchRunSuccess { run { runId status } }
@@ -1437,6 +1442,7 @@ def launch_job(
         "repoName": repository_name,
         "jobName": job_name,
         "solidSelection": solid_selection,
+        "runConfigData": run_config or {},
         "executionMetadata": execution_metadata or None,
     }
     data = gql(query, variables, env=env)
