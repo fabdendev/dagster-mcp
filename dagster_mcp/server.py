@@ -1074,13 +1074,17 @@ def list_sensors(env: str | None = None) -> list[dict]:
 def get_tick_history(
     instigator_name: str,
     instigator_type: str,
+    repository_name: str,
+    repository_location_name: str,
     limit: int = 20,
     env: str | None = None,
 ) -> dict:
     """Get recent tick history for a schedule or sensor — essential for detecting silent failures.
 
     - instigator_name: exact name of the schedule or sensor (from list_schedules/list_sensors)
-    - instigator_type: 'SCHEDULE' or 'SENSOR'
+    - instigator_type: 'SCHEDULE' or 'SENSOR' (for validation; the actual type is also returned)
+    - repository_name: containing repository (from list_schedules/list_sensors `repository` field)
+    - repository_location_name: containing code location (from `location` field)
     - limit: max ticks to return (default 20)
 
     Returns per tick: tick_id, status (SUCCESS/FAILURE/SKIPPED), timestamp,
@@ -1098,53 +1102,53 @@ def get_tick_history(
         raise ValueError("instigator_type must be 'SCHEDULE' or 'SENSOR'.")
 
     query = """
-    query TickHistory($instigatorType: InstigationType!, $limit: Int!) {
-      instigationStatesOrError(instigationType: $instigatorType) {
-        ... on InstigationStates {
-          results {
-            name
-            instigationType
-            ticks(limit: $limit) {
-              tickId
-              status
-              timestamp
-              error { message }
-              runIds
-            }
+    query TickHistory($selector: InstigationSelector!, $limit: Int!) {
+      instigationStateOrError(instigationSelector: $selector) {
+        __typename
+        ... on InstigationState {
+          name
+          instigationType
+          ticks(limit: $limit) {
+            tickId
+            status
+            timestamp
+            error { message }
+            runIds
           }
         }
+        ... on InstigationStateNotFoundError { message }
         ... on PythonError { message }
       }
     }
     """
-    data = gql(query, {"instigatorType": instigator_type, "limit": limit}, env=env)
-    states = data.get("instigationStatesOrError", {})
+    selector = {
+        "name": instigator_name,
+        "repositoryName": repository_name,
+        "repositoryLocationName": repository_location_name,
+    }
+    data = gql(query, {"selector": selector, "limit": limit}, env=env)
+    state = data.get("instigationStateOrError", {})
 
-    if "message" in states:
-        return states
-
-    results = states.get("results", [])
-    for r in results:
-        if r["name"] == instigator_name:
-            return {
-                "name": r["name"],
-                "instigator_type": r["instigationType"],
-                "ticks": [
-                    {
-                        "tick_id": t["tickId"],
-                        "status": t["status"],
-                        "timestamp": t["timestamp"],
-                        "error": t.get("error", {}).get("message") if t.get("error") else None,
-                        "run_ids": t.get("runIds", []),
-                    }
-                    for t in r.get("ticks", [])
-                ],
-            }
+    if state.get("__typename") != "InstigationState":
+        return {
+            "name": instigator_name,
+            "instigator_type": instigator_type,
+            "message": state.get("message", "Unknown error"),
+        }
 
     return {
-        "name": instigator_name,
-        "instigator_type": instigator_type,
-        "message": f"{instigator_type.capitalize()} '{instigator_name}' not found.",
+        "name": state["name"],
+        "instigator_type": state["instigationType"],
+        "ticks": [
+            {
+                "tick_id": t["tickId"],
+                "status": t["status"],
+                "timestamp": t["timestamp"],
+                "error": t.get("error", {}).get("message") if t.get("error") else None,
+                "run_ids": t.get("runIds", []),
+            }
+            for t in state.get("ticks", [])
+        ],
     }
 
 

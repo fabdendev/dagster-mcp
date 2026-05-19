@@ -74,42 +74,66 @@ class TestListSensors:
 
 class TestGetTickHistory:
     def test_schedule_ticks(self, mock_gql):
-        mock_gql({"data": {"instigationStatesOrError": {"results": [
-            {"name": "daily_sched", "instigationType": "SCHEDULE", "ticks": [
+        mock_gql({"data": {"instigationStateOrError": {
+            "__typename": "InstigationState",
+            "name": "daily_sched",
+            "instigationType": "SCHEDULE",
+            "ticks": [
                 {"tickId": "t1", "status": "SUCCESS", "timestamp": "1000",
                  "error": None, "runIds": ["r1"]},
                 {"tickId": "t2", "status": "SKIPPED", "timestamp": "900",
                  "error": None, "runIds": []},
-            ]},
-        ]}}})
-        result = get_tick_history("daily_sched", "SCHEDULE", limit=10)
+            ],
+        }}})
+        result = get_tick_history("daily_sched", "SCHEDULE", "repo1", "loc1", limit=10)
         assert result["name"] == "daily_sched"
         assert len(result["ticks"]) == 2
         assert result["ticks"][0]["status"] == "SUCCESS"
         assert result["ticks"][0]["run_ids"] == ["r1"]
 
     def test_sensor_ticks_with_error(self, mock_gql):
-        mock_gql({"data": {"instigationStatesOrError": {"results": [
-            {"name": "my_sensor", "instigationType": "SENSOR", "ticks": [
+        mock_gql({"data": {"instigationStateOrError": {
+            "__typename": "InstigationState",
+            "name": "my_sensor",
+            "instigationType": "SENSOR",
+            "ticks": [
                 {"tickId": "t1", "status": "FAILURE", "timestamp": "1000",
                  "error": {"message": "Connection refused"}, "runIds": []},
-            ]},
-        ]}}})
-        result = get_tick_history("my_sensor", "sensor")
+            ],
+        }}})
+        result = get_tick_history("my_sensor", "sensor", "repo1", "loc1")
         assert result["ticks"][0]["error"] == "Connection refused"
 
     def test_not_found(self, mock_gql):
-        mock_gql({"data": {"instigationStatesOrError": {"results": [
-            {"name": "other_sensor", "instigationType": "SENSOR", "ticks": []},
-        ]}}})
-        result = get_tick_history("missing_sensor", "SENSOR")
-        assert "not found" in result["message"]
+        mock_gql({"data": {"instigationStateOrError": {
+            "__typename": "InstigationStateNotFoundError",
+            "message": "Could not find instigation state for `missing_sensor`",
+        }}})
+        result = get_tick_history("missing_sensor", "SENSOR", "repo1", "loc1")
+        assert "Could not find" in result["message"]
 
     def test_invalid_type(self, mock_gql):
         with pytest.raises(ValueError, match="must be 'SCHEDULE' or 'SENSOR'"):
-            get_tick_history("x", "INVALID")
+            get_tick_history("x", "INVALID", "repo1", "loc1")
 
     def test_python_error(self, mock_gql):
-        mock_gql({"data": {"instigationStatesOrError": {"message": "Something broke"}}})
-        result = get_tick_history("x", "SCHEDULE")
+        mock_gql({"data": {"instigationStateOrError": {
+            "__typename": "PythonError",
+            "message": "Something broke",
+        }}})
+        result = get_tick_history("x", "SCHEDULE", "repo1", "loc1")
         assert result["message"] == "Something broke"
+
+    def test_selector_passed_to_query(self, mock_gql):
+        mock_post = mock_gql({"data": {"instigationStateOrError": {
+            "__typename": "InstigationState",
+            "name": "daily_sched", "instigationType": "SCHEDULE", "ticks": [],
+        }}})
+        get_tick_history("daily_sched", "SCHEDULE", "myrepo", "myloc", limit=5)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"]["selector"] == {
+            "name": "daily_sched",
+            "repositoryName": "myrepo",
+            "repositoryLocationName": "myloc",
+        }
+        assert payload["variables"]["limit"] == 5
