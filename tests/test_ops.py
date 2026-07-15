@@ -73,15 +73,27 @@ class TestListSensors:
 
 
 class TestGetTickHistory:
+    # get_tick_history makes two gql calls: first resolves the instigator's repo +
+    # location (repositoriesOrError), then fetches ticks (instigationStateOrError).
+    # mock_gql reuses one response for both, so combine both keys in a single dict.
+    @staticmethod
+    def _locate(name, field):
+        return {"nodes": [
+            {"name": "repo", "location": {"name": "loc"},
+             "schedules": [{"name": name}] if field == "schedules" else [],
+             "sensors": [{"name": name}] if field == "sensors" else []},
+        ]}
+
     def test_schedule_ticks(self, mock_gql):
-        mock_gql({"data": {"instigationStatesOrError": {"results": [
-            {"name": "daily_sched", "instigationType": "SCHEDULE", "ticks": [
+        mock_gql({"data": {
+            "repositoriesOrError": self._locate("daily_sched", "schedules"),
+            "instigationStateOrError": {"ticks": [
                 {"tickId": "t1", "status": "SUCCESS", "timestamp": "1000",
                  "error": None, "runIds": ["r1"]},
                 {"tickId": "t2", "status": "SKIPPED", "timestamp": "900",
                  "error": None, "runIds": []},
             ]},
-        ]}}})
+        }})
         result = get_tick_history("daily_sched", "SCHEDULE", limit=10)
         assert result["name"] == "daily_sched"
         assert len(result["ticks"]) == 2
@@ -89,18 +101,20 @@ class TestGetTickHistory:
         assert result["ticks"][0]["run_ids"] == ["r1"]
 
     def test_sensor_ticks_with_error(self, mock_gql):
-        mock_gql({"data": {"instigationStatesOrError": {"results": [
-            {"name": "my_sensor", "instigationType": "SENSOR", "ticks": [
+        mock_gql({"data": {
+            "repositoriesOrError": self._locate("my_sensor", "sensors"),
+            "instigationStateOrError": {"ticks": [
                 {"tickId": "t1", "status": "FAILURE", "timestamp": "1000",
                  "error": {"message": "Connection refused"}, "runIds": []},
             ]},
-        ]}}})
+        }})
         result = get_tick_history("my_sensor", "sensor")
         assert result["ticks"][0]["error"] == "Connection refused"
 
     def test_not_found(self, mock_gql):
-        mock_gql({"data": {"instigationStatesOrError": {"results": [
-            {"name": "other_sensor", "instigationType": "SENSOR", "ticks": []},
+        mock_gql({"data": {"repositoriesOrError": {"nodes": [
+            {"name": "repo", "location": {"name": "loc"},
+             "schedules": [], "sensors": [{"name": "other_sensor"}]},
         ]}}})
         result = get_tick_history("missing_sensor", "SENSOR")
         assert "not found" in result["message"]
@@ -110,6 +124,9 @@ class TestGetTickHistory:
             get_tick_history("x", "INVALID")
 
     def test_python_error(self, mock_gql):
-        mock_gql({"data": {"instigationStatesOrError": {"message": "Something broke"}}})
+        mock_gql({"data": {
+            "repositoriesOrError": self._locate("x", "schedules"),
+            "instigationStateOrError": {"message": "Something broke"},
+        }})
         result = get_tick_history("x", "SCHEDULE")
         assert result["message"] == "Something broke"

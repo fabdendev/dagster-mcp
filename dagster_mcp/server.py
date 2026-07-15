@@ -720,7 +720,7 @@ def get_recent_materializations(
       }
     }
     """
-    data = gql(query, {"assetKey": {"path": [asset_key]}, "limit": limit}, env=env)
+    data = gql(query, {"assetKey": {"path": asset_key.split("/")}, "limit": limit}, env=env)
     asset = data.get("assetOrError", {})
     return asset.get("assetMaterializations", [])
 
@@ -759,7 +759,7 @@ def get_asset_details(asset_keys: list[str], env: str | None = None) -> list[dic
       }
     }
     """
-    keys = [{"path": [k]} for k in asset_keys]
+    keys = [{"path": k.split("/")} for k in asset_keys]
     data = gql(query, {"assetKeys": keys}, env=env)
     return data.get("assetNodes", [])
 
@@ -848,7 +848,7 @@ def get_asset_health(asset_key_or_group: str, env: str | None = None) -> list[di
     if group_keys:
         asset_keys_input = [{"path": k} for k in group_keys]
     else:
-        asset_keys_input = [{"path": [asset_key_or_group]}]
+        asset_keys_input = [{"path": asset_key_or_group.split("/")}]
 
     # Fetch health details
     health_query = """
@@ -1097,54 +1097,74 @@ def get_tick_history(
     if instigator_type not in ("SCHEDULE", "SENSOR"):
         raise ValueError("instigator_type must be 'SCHEDULE' or 'SENSOR'.")
 
-    query = """
-    query TickHistory($instigatorType: InstigationType!, $limit: Int!) {
-      instigationStatesOrError(instigationType: $instigatorType) {
-        ... on InstigationStates {
-          results {
+    # Resolve repo + location for the named instigator (selector needs all three).
+    locate = """
+    query Locate {
+      repositoriesOrError {
+        ... on RepositoryConnection {
+          nodes {
             name
-            instigationType
-            ticks(limit: $limit) {
-              tickId
-              status
-              timestamp
-              error { message }
-              runIds
-            }
+            location { name }
+            schedules { name }
+            sensors { name }
           }
         }
         ... on PythonError { message }
       }
     }
     """
-    data = gql(query, {"instigatorType": instigator_type, "limit": limit}, env=env)
-    states = data.get("instigationStatesOrError", {})
-
-    if "message" in states:
-        return states
-
-    results = states.get("results", [])
-    for r in results:
-        if r["name"] == instigator_name:
-            return {
-                "name": r["name"],
-                "instigator_type": r["instigationType"],
-                "ticks": [
-                    {
-                        "tick_id": t["tickId"],
-                        "status": t["status"],
-                        "timestamp": t["timestamp"],
-                        "error": t.get("error", {}).get("message") if t.get("error") else None,
-                        "run_ids": t.get("runIds", []),
-                    }
-                    for t in r.get("ticks", [])
-                ],
+    repos = gql(locate, env=env).get("repositoriesOrError", {}).get("nodes", [])
+    field = "schedules" if instigator_type == "SCHEDULE" else "sensors"
+    selector = None
+    for repo in repos:
+        if any(i["name"] == instigator_name for i in repo.get(field, [])):
+            selector = {
+                "repositoryName": repo["name"],
+                "repositoryLocationName": repo["location"]["name"],
+                "name": instigator_name,
             }
+            break
+    if selector is None:
+        return {
+            "name": instigator_name,
+            "instigator_type": instigator_type,
+            "message": f"{instigator_type.capitalize()} '{instigator_name}' not found.",
+        }
 
+    query = """
+    query TickHistory($selector: InstigationSelector!, $limit: Int!) {
+      instigationStateOrError(instigationSelector: $selector) {
+        ... on InstigationState {
+          ticks(limit: $limit) {
+            tickId
+            status
+            timestamp
+            error { message }
+            runIds
+          }
+        }
+        ... on PythonError { message }
+      }
+    }
+    """
+    state = gql(query, {"selector": selector, "limit": limit}, env=env).get(
+        "instigationStateOrError", {}
+    )
+    if "message" in state:
+        return state
     return {
         "name": instigator_name,
         "instigator_type": instigator_type,
-        "message": f"{instigator_type.capitalize()} '{instigator_name}' not found.",
+        "ticks": [
+            {
+                "tick_id": t["tickId"],
+                "status": t["status"],
+                "timestamp": t["timestamp"],
+                "error": t.get("error", {}).get("message") if t.get("error") else None,
+                "run_ids": t.get("runIds", []),
+            }
+            for t in state.get("ticks", [])
+        ],
     }
 
 
@@ -1324,7 +1344,7 @@ def list_backfills(limit: int = 10, env: str | None = None) -> list[dict]:
       partitionBackfillsOrError(cursor: $cursor, limit: $limit) {
         ... on PartitionBackfills {
           results {
-            backfillId
+            backfillId: id
             status
             numPartitions
             timestamp
