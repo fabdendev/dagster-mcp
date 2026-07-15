@@ -1192,6 +1192,7 @@ def get_tick_history(
     query = """
     query TickHistory($selector: InstigationSelector!, $limit: Int!) {
       instigationStateOrError(instigationSelector: $selector) {
+        __typename
         ... on InstigationState {
           ticks(limit: $limit) {
             tickId
@@ -1201,6 +1202,7 @@ def get_tick_history(
             runIds
           }
         }
+        ... on InstigationStateNotFoundError { message }
         ... on PythonError { message }
       }
     }
@@ -1208,8 +1210,12 @@ def get_tick_history(
     state = gql(query, {"selector": selector, "limit": limit}, env=env).get(
         "instigationStateOrError", {}
     )
-    if "message" in state:
-        return state
+    if state.get("__typename") != "InstigationState":
+        return {
+            "name": instigator_name,
+            "instigator_type": instigator_type,
+            "message": state.get("message", "Unknown error"),
+        }
     return {
         "name": instigator_name,
         "instigator_type": instigator_type,

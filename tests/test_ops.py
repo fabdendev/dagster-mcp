@@ -87,7 +87,7 @@ class TestGetTickHistory:
     def test_schedule_ticks(self, mock_gql):
         mock_gql({"data": {
             "repositoriesOrError": self._locate("daily_sched", "schedules"),
-            "instigationStateOrError": {"ticks": [
+            "instigationStateOrError": {"__typename": "InstigationState", "ticks": [
                 {"tickId": "t1", "status": "SUCCESS", "timestamp": "1000",
                  "error": None, "runIds": ["r1"]},
                 {"tickId": "t2", "status": "SKIPPED", "timestamp": "900",
@@ -103,7 +103,7 @@ class TestGetTickHistory:
     def test_sensor_ticks_with_error(self, mock_gql):
         mock_gql({"data": {
             "repositoriesOrError": self._locate("my_sensor", "sensors"),
-            "instigationStateOrError": {"ticks": [
+            "instigationStateOrError": {"__typename": "InstigationState", "ticks": [
                 {"tickId": "t1", "status": "FAILURE", "timestamp": "1000",
                  "error": {"message": "Connection refused"}, "runIds": []},
             ]},
@@ -126,7 +126,19 @@ class TestGetTickHistory:
     def test_python_error(self, mock_gql):
         mock_gql({"data": {
             "repositoriesOrError": self._locate("x", "schedules"),
-            "instigationStateOrError": {"message": "Something broke"},
+            "instigationStateOrError": {"__typename": "PythonError", "message": "Something broke"},
         }})
         result = get_tick_history("x", "SCHEDULE")
         assert result["message"] == "Something broke"
+
+    def test_instigation_state_not_found(self, mock_gql):
+        # Selector resolves locally but the backend has no state for it yet.
+        mock_gql({"data": {
+            "repositoriesOrError": self._locate("x", "schedules"),
+            "instigationStateOrError": {
+                "__typename": "InstigationStateNotFoundError",
+                "message": "No instigation state found",
+            },
+        }})
+        result = get_tick_history("x", "SCHEDULE")
+        assert result["message"] == "No instigation state found"
