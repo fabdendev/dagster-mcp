@@ -33,7 +33,7 @@ Agent: Re-launching the failed job...
 
 ## What it does
 
-19 tools across 6 categories, designed for autonomous DataOps workflows:
+20 tools across 6 categories, designed for autonomous DataOps workflows:
 
 | Category | Tools | What an agent can do |
 |----------|-------|---------------------|
@@ -218,7 +218,7 @@ Add to `claude_desktop_config.json`:
 |------|-------------|
 | `get_runs` | List recent runs, filter by job name and/or status |
 | `get_run_status` | Get status, config, tags, and run lineage (re-execution chain via rootRunId/parentRunId) |
-| `get_run_logs` | Get structured log events with pagination and optional level filtering (`ERROR`, `WARNING`, `INFO`) |
+| `get_run_logs` | Get structured log events with pagination and optional level filtering (`ERROR`, `WARNING`, `INFO`); EngineEvent events include `metadataEntries` |
 | `get_run_stats` | Get per-step execution stats: timing, materializations, expectation results |
 | `get_run_failure_summary` | **Consolidated failure diagnosis** — failed steps, root cause error, step durations, and suggestions in one call |
 
@@ -278,7 +278,7 @@ Tested with Dagster 1.6+. The `RunsFilter` field name (`jobName` vs `pipelineNam
 ```bash
 uv sync --extra dev
 uv run ruff check dagster_mcp/    # lint
-uv run pytest                     # tests (98 tests)
+uv run pytest                     # tests (110 tests)
 uv run python -m dagster_mcp      # start server locally
 ```
 
