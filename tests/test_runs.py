@@ -150,6 +150,32 @@ class TestGetRunLogs:
         assert result["hasMore"] is False
         assert len(result["events"]) == 2
 
+    def test_engine_event_metadata_flattened(self, mock_gql):
+        mock_gql({"data": {"logsForRun": {
+            "cursor": "c1", "hasMore": False,
+            "events": [
+                {"__typename": "EngineEvent", "timestamp": "1000",
+                 "message": "Launching run in k8s", "level": "INFO",
+                 "stepKey": None, "error": None,
+                 "metadataEntries": [
+                     {"__typename": "TextMetadataEntry", "label": "pod",
+                      "description": None, "text": "run-abc"},
+                     {"__typename": "UrlMetadataEntry", "label": "logs",
+                      "description": "dashboard", "url": "http://x/logs"},
+                     {"__typename": "IntMetadataEntry", "label": "retries",
+                      "description": None, "intValue": 3},
+                     {"__typename": "PythonArtifactMetadataEntry", "label": "image",
+                      "description": None, "module": "acme", "name": "worker"},
+                 ]},
+            ],
+        }}})
+        result = get_run_logs("r1")
+        md = result["events"][0]["metadataEntries"]
+        assert md[0] == {"label": "pod", "description": None, "value": "run-abc"}
+        assert md[1]["value"] == "http://x/logs"
+        assert md[2]["value"] == 3
+        assert md[3]["value"] == "acme.worker"
+
     def test_pagination(self, mock_gql):
         mock_post = mock_gql({"data": {"logsForRun": {
             "cursor": "c2", "hasMore": True, "events": [],
