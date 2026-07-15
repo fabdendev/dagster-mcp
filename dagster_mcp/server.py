@@ -186,6 +186,56 @@ def gql(query: str, variables: dict | None = None, env: str | None = None) -> di
     return data["data"]
 
 
+# GraphQL selection for MetadataEntry — covers the common concrete types.
+# Reused wherever a log event exposes metadataEntries.
+_METADATA_ENTRIES_FRAGMENT = """
+              metadataEntries {
+                __typename
+                label
+                description
+                ... on TextMetadataEntry { text }
+                ... on UrlMetadataEntry { url }
+                ... on PathMetadataEntry { path }
+                ... on JsonMetadataEntry { jsonString }
+                ... on MarkdownMetadataEntry { mdStr }
+                ... on FloatMetadataEntry { floatValue }
+                ... on IntMetadataEntry { intValue }
+                ... on BoolMetadataEntry { boolValue }
+                ... on PythonArtifactMetadataEntry { module name }
+              }"""
+
+# Maps each MetadataEntry __typename to the field holding its value.
+_METADATA_VALUE_FIELDS = {
+    "TextMetadataEntry": "text",
+    "UrlMetadataEntry": "url",
+    "PathMetadataEntry": "path",
+    "JsonMetadataEntry": "jsonString",
+    "MarkdownMetadataEntry": "mdStr",
+    "FloatMetadataEntry": "floatValue",
+    "IntMetadataEntry": "intValue",
+    "BoolMetadataEntry": "boolValue",
+}
+
+
+def _flatten_metadata(entries: list[dict] | None) -> list[dict]:
+    """Flatten raw metadataEntries into {label, description, value} dicts.
+
+    Value is pulled from the type-specific field; PythonArtifact combines
+    module + name; unknown types fall back to None.
+    """
+    flat = []
+    for e in entries or []:
+        typename = e.get("__typename")
+        if typename == "PythonArtifactMetadataEntry":
+            value = f"{e.get('module')}.{e.get('name')}"
+        else:
+            value = e.get(_METADATA_VALUE_FIELDS.get(typename, ""))
+        flat.append(
+            {"label": e.get("label"), "description": e.get("description"), "value": value}
+        )
+    return flat
+
+
 # ── Runs ──────────────────────────────────────────────────────────────────────
 
 
@@ -293,7 +343,9 @@ def get_run_logs(
 
     Returns events with __typename, timestamp, message, level, and (where applicable)
     stepKey and error details. Events include step starts/completions, failures,
-    retries, materializations, and run-level events.
+    retries, materializations, and run-level events. EngineEvent events also carry
+    metadataEntries — a list of {label, description, value} dicts (e.g. run worker
+    image, k8s pod name, step keys) surfaced by the engine.
 
     Parameters:
     - run_id: the run to fetch logs for
@@ -409,6 +461,7 @@ def get_run_logs(
               level
               stepKey
               error { message causes { message } }
+__METADATA_ENTRIES__
             }
             ... on RunStartEvent {
               timestamp
@@ -452,8 +505,13 @@ def get_run_logs(
       }
     }
     """
+    query = query.replace("__METADATA_ENTRIES__", _METADATA_ENTRIES_FRAGMENT)
     data = gql(query, {"runId": run_id, "afterCursor": cursor, "limit": limit}, env=env)
     result = data.get("logsForRun", {})
+
+    for event in result.get("events", []):
+        if "metadataEntries" in event:
+            event["metadataEntries"] = _flatten_metadata(event["metadataEntries"])
 
     if level_filter and "events" in result:
         upper = level_filter.upper()
