@@ -147,37 +147,6 @@ class TestLaunchJobWithPartitions:
 
 
 class TestBackfillAssets:
-    def _mock_partition_keys(self, mock_gql, keys, backfill_ok=True):
-        """First gql call resolves partitionKeys, second launches the backfill."""
-        from unittest.mock import MagicMock, patch
-
-        responses = [
-            {"data": {"assetNodes": [{"partitionKeys": keys}]}},
-        ]
-        if backfill_ok:
-            responses.append(
-                {"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}}
-            )
-
-        # Create mock responses
-        mock_responses = []
-        for resp_data in responses:
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = resp_data
-            import json
-            mock_resp.text = json.dumps(resp_data)
-            mock_responses.append(mock_resp)
-
-        # Patch httpx.post with side_effect
-        import httpx
-        mock_post = MagicMock(side_effect=mock_responses)
-        import dagster_mcp.server
-        with patch.object(httpx, 'post', mock_post):
-            pass  # The patch context manager is entered; tests will use it
-
-        return mock_post
-
     def test_explicit_partition_keys_skip_resolution(self, mock_gql):
         mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}})
         result = backfill_assets(["asset_a"], partition_keys=["2026-07-01", "2026-07-02"])
