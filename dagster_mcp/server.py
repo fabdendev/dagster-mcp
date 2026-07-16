@@ -1484,6 +1484,8 @@ def launch_job(
     When to use: to re-run a failed job, trigger an ad-hoc materialization,
     or launch a job with custom config or tags. After launching, use
     get_run_status or get_runs to monitor progress.
+    For partitioned ASSET backfills — especially an asset inside a multi-asset
+    /dbt op, or one with a single_run backfill policy — use backfill_assets.
     """
     execution_metadata: dict = {}
     if tags:
@@ -1569,6 +1571,9 @@ def launch_job_with_partitions(
 
     When to use: to run a job for a specific date/partition, backfill historical
     partitions, or retry failed partitions. For non-partitioned jobs, use launch_job.
+    NOTE: this launches one run PER partition via the job's partition set. For
+    asset-selection backfills that respect BackfillPolicy.single_run (one ranged
+    run), use backfill_assets.
     """
     resolved_partition_set = partition_set_name or f"{job_name}_partition_set"
     tag_list = [{"key": k, "value": v} for k, v in tags.items()] if tags else []
@@ -1603,6 +1608,124 @@ def launch_job_with_partitions(
     return data.get("launchPartitionBackfill", {})
 
 
+def backfill_assets(
+    asset_keys: list[str],
+    partition_start: str | None = None,
+    partition_end: str | None = None,
+    partition_keys: list[str] | None = None,
+    tags: dict[str, str] | None = None,
+    env: str | None = None,
+) -> dict:
+    """Launch a partition backfill for specific ASSETS (asset selection, not job).
+
+    This is the MCP equivalent of the UI's "Materialize → partition range".
+    Dagster resolves each asset's BackfillPolicy server-side: assets with
+    BackfillPolicy.single_run() get ONE ranged run (vars min/max spanning the
+    whole range); others get per-partition runs.
+
+    Use this instead of:
+    - launch_job(asset_keys=...): fails with DagsterInvalidSubsetError for an
+      asset inside a multi-asset op (e.g. one dbt model inside a dbt_assets op),
+      and cannot target partitions.
+    - launch_job_with_partitions: partition-set (whole-job) selection that
+      creates one run PER partition key — breaks single_run backfill policies.
+
+    Required parameters:
+    - asset_keys: asset key strings, e.g. ['clean_es_email_activity_detail'].
+      Multiple assets must share a partition definition (same rule as the UI).
+
+    Optional parameters:
+    - partition_start / partition_end: inclusive bounds. Resolved against the
+      asset's actual partition keys (fetched via GraphQL), so any partition
+      definition works (daily/weekly/monthly/static). Omitted bounds default
+      to the first / latest key. Use the SAME format the asset uses
+      (e.g. '2026-05-25' for daily).
+    - partition_keys: explicit key list; overrides partition_start/end.
+    - tags: extra run tags, e.g. {'triggered_by': 'dataops_agent'}.
+
+    Returns {'backfillId': ...} on success or {'message': <error>} on failure.
+    Monitor with list_backfills; runs carry the dagster/backfill tag.
+    """
+    if partition_keys is None:
+        query = """
+        query AssetPartitionKeys($assetKeys: [AssetKeyInput!]!) {
+          assetNodes(assetKeys: $assetKeys) {
+            partitionKeys
+          }
+        }
+        """
+        nodes = gql(
+            query,
+            {"assetKeys": [{"path": [asset_keys[0]]}]},
+            env=env,
+        ).get("assetNodes", [])
+        all_keys: list[str] = nodes[0].get("partitionKeys", []) if nodes else []
+        if not all_keys:
+            return {
+                "message": (
+                    f"Asset '{asset_keys[0]}' is not partitioned (or not found) — "
+                    "use launch_job for unpartitioned assets."
+                )
+            }
+
+        def _bound_index(bound: str, default: int, side: str) -> int | dict:
+            if bound is None:
+                return default
+            try:
+                return all_keys.index(bound)
+            except ValueError:
+                import bisect
+
+                pos = bisect.bisect_left(all_keys, bound)
+                nearest = all_keys[max(0, pos - 1) : pos + 2]
+                return {
+                    "message": (
+                        f"partition_{side} '{bound}' is not a partition key of "
+                        f"'{asset_keys[0]}'. Nearest keys: {nearest}."
+                    )
+                }
+
+        start_idx = _bound_index(partition_start, 0, "start")
+        if isinstance(start_idx, dict):
+            return start_idx
+        end_idx = _bound_index(partition_end, len(all_keys) - 1, "end")
+        if isinstance(end_idx, dict):
+            return end_idx
+        if start_idx > end_idx:
+            return {
+                "message": (
+                    f"partition_start '{all_keys[start_idx]}' is after "
+                    f"partition_end '{all_keys[end_idx]}'."
+                )
+            }
+        partition_keys = all_keys[start_idx : end_idx + 1]
+
+    tag_list = [{"key": k, "value": v} for k, v in tags.items()] if tags else []
+
+    query = """
+    mutation LaunchAssetBackfill($backfillParams: LaunchBackfillParams!) {
+      launchPartitionBackfill(backfillParams: $backfillParams) {
+        ... on LaunchBackfillSuccess { backfillId }
+        ... on PartitionSetNotFoundError { message }
+        ... on PipelineNotFoundError { message }
+        ... on PythonError { message }
+        ... on UnauthorizedError { message }
+        ... on InvalidSubsetError { message }
+        ... on RunConfigValidationInvalid { errors { message } }
+      }
+    }
+    """
+    variables = {
+        "backfillParams": {
+            "assetSelection": [{"path": [k]} for k in asset_keys],
+            "partitionNames": partition_keys,
+            "tags": tag_list,
+        }
+    }
+    data = gql(query, variables, env=env)
+    return data.get("launchPartitionBackfill", {})
+
+
 # ── Write tools (only registered when DAGSTER_READ_ONLY=false) ────────────────
 
 if not READ_ONLY:
@@ -1610,6 +1733,7 @@ if not READ_ONLY:
     mcp.tool()(terminate_run)
     mcp.tool()(launch_job)
     mcp.tool()(launch_job_with_partitions)
+    mcp.tool()(backfill_assets)
 
 
 def main():
