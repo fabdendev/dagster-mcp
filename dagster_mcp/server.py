@@ -1,5 +1,6 @@
 """Dagster MCP server — GraphQL wrapper for self-hosted and Dagster Cloud instances."""
 
+import bisect
 import json
 import os
 import httpx
@@ -1632,6 +1633,7 @@ def backfill_assets(
 
     Required parameters:
     - asset_keys: asset key strings, e.g. ['clean_es_email_activity_detail'].
+      Nested keys use '/' as the path separator (e.g. 'raw_chargebee_dlt/customer').
       Multiple assets must share a partition definition (same rule as the UI).
 
     Optional parameters:
@@ -1656,7 +1658,7 @@ def backfill_assets(
         """
         nodes = gql(
             query,
-            {"assetKeys": [{"path": [asset_keys[0]]}]},
+            {"assetKeys": [{"path": asset_keys[0].split("/")}]},
             env=env,
         ).get("assetNodes", [])
         all_keys: list[str] = nodes[0].get("partitionKeys", []) if nodes else []
@@ -1674,8 +1676,8 @@ def backfill_assets(
             try:
                 return all_keys.index(bound)
             except ValueError:
-                import bisect
-
+                # Best-effort "nearest keys" hint; assumes lexicographically
+                # sorted partition keys (true for daily/monthly, not static).
                 pos = bisect.bisect_left(all_keys, bound)
                 nearest = all_keys[max(0, pos - 1) : pos + 2]
                 return {
@@ -1717,7 +1719,7 @@ def backfill_assets(
     """
     variables = {
         "backfillParams": {
-            "assetSelection": [{"path": [k]} for k in asset_keys],
+            "assetSelection": [{"path": k.split("/")} for k in asset_keys],
             "partitionNames": partition_keys,
             "tags": tag_list,
         }
