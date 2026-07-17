@@ -1,4 +1,9 @@
-from dagster_mcp.server import launch_job, launch_job_with_partitions, terminate_run, reload_code_location
+import json
+from unittest.mock import MagicMock
+
+import httpx
+
+from dagster_mcp.server import launch_job, launch_job_with_partitions, terminate_run, reload_code_location, backfill_assets
 
 
 class TestTerminateRun:
@@ -144,6 +149,124 @@ class TestLaunchJobWithPartitions:
         }}})
         result = launch_job_with_partitions("bad_job", "loc1", ["2024-01-01"])
         assert "message" in result
+
+
+class TestBackfillAssets:
+    def test_explicit_partition_keys_skip_resolution(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}})
+        result = backfill_assets(["asset_a"], partition_keys=["2026-07-01", "2026-07-02"])
+        assert result["backfillId"] == "bf1"
+        payload = mock_post.call_args.kwargs["json"]
+        params = payload["variables"]["backfillParams"]
+        assert params["partitionNames"] == ["2026-07-01", "2026-07-02"]
+        assert params["assetSelection"] == [{"path": ["asset_a"]}]
+        assert "partitionSetName" not in str(payload)
+
+    def test_range_sliced_from_asset_partition_keys(self, mock_gql, monkeypatch):
+        # Create two responses: partition keys query, then backfill launch
+        keys_resp = MagicMock()
+        keys_resp.status_code = 200
+        keys_resp.json.return_value = {"data": {"assetNodes": [{"partitionKeys": ["2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04"]}]}}
+        keys_resp.text = json.dumps(keys_resp.json.return_value)
+
+        backfill_resp = MagicMock()
+        backfill_resp.status_code = 200
+        backfill_resp.json.return_value = {"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}}
+        backfill_resp.text = json.dumps(backfill_resp.json.return_value)
+
+        mock_post = MagicMock(side_effect=[keys_resp, backfill_resp])
+        monkeypatch.setattr(httpx, "post", mock_post)
+
+        result = backfill_assets(
+            ["asset_a"], partition_start="2026-07-02", partition_end="2026-07-03"
+        )
+        assert result["backfillId"] == "bf1"
+        payload = mock_post.call_args.kwargs["json"]
+        params = payload["variables"]["backfillParams"]
+        assert params["partitionNames"] == ["2026-07-02", "2026-07-03"]
+
+    def test_range_defaults_to_full_key_list(self, mock_gql, monkeypatch):
+        keys_resp = MagicMock()
+        keys_resp.status_code = 200
+        keys_resp.json.return_value = {"data": {"assetNodes": [{"partitionKeys": ["p1", "p2", "p3"]}]}}
+        keys_resp.text = json.dumps(keys_resp.json.return_value)
+
+        backfill_resp = MagicMock()
+        backfill_resp.status_code = 200
+        backfill_resp.json.return_value = {"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}}
+        backfill_resp.text = json.dumps(backfill_resp.json.return_value)
+
+        mock_post = MagicMock(side_effect=[keys_resp, backfill_resp])
+        monkeypatch.setattr(httpx, "post", mock_post)
+
+        backfill_assets(["asset_a"])
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"]["backfillParams"]["partitionNames"] == ["p1", "p2", "p3"]
+
+    def test_bad_bound_reports_nearest_keys(self, mock_gql, monkeypatch):
+        keys_resp = MagicMock()
+        keys_resp.status_code = 200
+        keys_resp.json.return_value = {"data": {"assetNodes": [{"partitionKeys": ["2026-07-01", "2026-07-02"]}]}}
+        keys_resp.text = json.dumps(keys_resp.json.return_value)
+
+        mock_post = MagicMock(side_effect=[keys_resp])
+        monkeypatch.setattr(httpx, "post", mock_post)
+
+        result = backfill_assets(["asset_a"], partition_start="2026-06-30")
+        assert "message" in result
+        assert "2026-07-01" in result["message"]
+
+    def test_unpartitioned_asset_errors(self, mock_gql, monkeypatch):
+        keys_resp = MagicMock()
+        keys_resp.status_code = 200
+        keys_resp.json.return_value = {"data": {"assetNodes": [{"partitionKeys": []}]}}
+        keys_resp.text = json.dumps(keys_resp.json.return_value)
+
+        mock_post = MagicMock(side_effect=[keys_resp])
+        monkeypatch.setattr(httpx, "post", mock_post)
+
+        result = backfill_assets(["asset_a"])
+        assert "message" in result
+        assert "not partitioned" in result["message"]
+
+    def test_multi_asset_selection_and_tags(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf2"}}})
+        backfill_assets(
+            ["asset_a", "asset_b"],
+            partition_keys=["p1"],
+            tags={"triggered_by": "agent"},
+        )
+        payload = mock_post.call_args.kwargs["json"]
+        params = payload["variables"]["backfillParams"]
+        assert params["assetSelection"] == [{"path": ["asset_a"]}, {"path": ["asset_b"]}]
+        assert params["tags"] == [{"key": "triggered_by", "value": "agent"}]
+
+    def test_multi_segment_asset_keys_split_into_path(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}})
+        backfill_assets(["raw_chargebee_dlt/customer"], partition_keys=["p1"])
+        payload = mock_post.call_args.kwargs["json"]
+        params = payload["variables"]["backfillParams"]
+        assert params["assetSelection"] == [{"path": ["raw_chargebee_dlt", "customer"]}]
+
+    def test_multi_segment_asset_key_resolution_split(self, monkeypatch):
+        keys_resp = MagicMock()
+        keys_resp.status_code = 200
+        keys_resp.json.return_value = {"data": {"assetNodes": [{"partitionKeys": ["p1", "p2"]}]}}
+        keys_resp.text = json.dumps(keys_resp.json.return_value)
+
+        backfill_resp = MagicMock()
+        backfill_resp.status_code = 200
+        backfill_resp.json.return_value = {"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}}
+        backfill_resp.text = json.dumps(backfill_resp.json.return_value)
+
+        mock_post = MagicMock(side_effect=[keys_resp, backfill_resp])
+        monkeypatch.setattr(httpx, "post", mock_post)
+
+        backfill_assets(["raw_chargebee_dlt/customer"])
+        lookup_payload = mock_post.call_args_list[0].kwargs["json"]
+        assert lookup_payload["variables"]["assetKeys"] == [
+            {"path": ["raw_chargebee_dlt", "customer"]}
+        ]
 
 
 class TestReadOnlyGating:
