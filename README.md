@@ -33,7 +33,7 @@ Agent: Re-launching the failed job...
 
 ## What it does
 
-20 tools across 6 categories, designed for autonomous DataOps workflows:
+21 tools across 6 categories, designed for autonomous DataOps workflows:
 
 | Category | Tools | What an agent can do |
 |----------|-------|---------------------|
@@ -42,7 +42,7 @@ Agent: Re-launching the failed job...
 | **Jobs** | `list_jobs` | Inventory all jobs across code locations |
 | **Schedules & Sensors** | `list_schedules` `list_sensors` `get_tick_history` | Detect silent failures, missed ticks, sensor errors |
 | **Instance** | `get_instance_status` `list_code_locations` `list_backfills` | Global health check, daemon status, code location errors |
-| **Actions** | `launch_job` `launch_job_with_partitions` `terminate_run` `reload_code_location` | Re-run failed jobs, backfill partitions, stop stuck runs, reload after deploy |
+| **Actions** | `launch_job` `launch_job_with_partitions` `backfill_assets` `terminate_run` `reload_code_location` | Re-run failed jobs, backfill partitions (job or asset selection), stop stuck runs, reload after deploy |
 
 > Actions are opt-in: set `DAGSTER_READ_ONLY=false` to enable write operations.
 
@@ -254,6 +254,7 @@ Add to `claude_desktop_config.json`:
 |------|-------------|
 | `launch_job` | Launch a job or materialize specific assets (supports tags and asset selection) |
 | `launch_job_with_partitions` | Launch a partitioned job for one or more partition keys; creates a backfill (supports `from_failure` to retry only failed steps) |
+| `backfill_assets` | Launch a partition backfill by **asset selection** (like the UI's "Materialize → partition range"); respects each asset's `BackfillPolicy` server-side. Use for assets inside a multi-asset/dbt op or with `single_run()` policy |
 | `terminate_run` | Stop a stuck or runaway run |
 | `reload_code_location` | Reload a code location after deploy |
 
@@ -278,7 +279,7 @@ Tested with Dagster 1.6+. The `RunsFilter` field name (`jobName` vs `pipelineNam
 ```bash
 uv sync --extra dev
 uv run ruff check dagster_mcp/    # lint
-uv run pytest                     # tests (110 tests)
+uv run pytest                     # tests (118 tests)
 uv run python -m dagster_mcp      # start server locally
 ```
 
