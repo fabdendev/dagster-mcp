@@ -6,6 +6,12 @@ import os
 import httpx
 from fastmcp import FastMCP
 
+from dagster_mcp.asset_selection import (
+    AssetSelectionSyntaxError,
+    parse_asset_selection,
+    resolve_asset_selection_nodes,
+)
+
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://localhost:3000")
 DAGSTER_API_TOKEN = os.environ.get("DAGSTER_API_TOKEN", "")
 DAGSTER_EXTRA_HEADERS = os.environ.get("DAGSTER_EXTRA_HEADERS", "")
@@ -125,38 +131,122 @@ def _build_headers(
 # ---------------------------------------------------------------------------
 
 _runs_filter_job_field: dict[str, str] = {}  # graphql_url -> field name
-
-_INTROSPECTION_QUERY = '{ __type(name: "RunsFilter") { inputFields { name } } }'
+_type_fields: dict[tuple[str, str, str], frozenset[str]] = {}
 
 
 def _get_runs_filter_job_field(env: str | None = None) -> str:
     """Return the correct RunsFilter field name for job filtering."""
-    graphql_url, api_token, extra_headers_json = _resolve_connection(env)
+    graphql_url, _, _ = _resolve_connection(env)
 
     if graphql_url in _runs_filter_job_field:
         return _runs_filter_job_field[graphql_url]
 
     try:
-        headers = _build_headers(api_token, extra_headers_json)
-        response = httpx.post(
-            graphql_url,
-            json={"query": _INTROSPECTION_QUERY},
-            headers=headers,
-            timeout=30,
-        )
-        data = response.json()
-        fields = {f["name"] for f in data.get("data", {}).get("__type", {}).get("inputFields", [])}
-        if "jobName" in fields:
-            field = "jobName"
-        elif "pipelineName" in fields:
-            field = "pipelineName"
-        else:
-            field = "jobName"
+        fields = _get_type_fields("RunsFilter", env=env, input_type=True)
     except Exception:
-        field = "jobName"
+        # Job filtering predates introspection support and historically used
+        # jobName, so preserve that fallback without caching a transient failure.
+        return "jobName"
 
+    field = "pipelineName" if "pipelineName" in fields and "jobName" not in fields else "jobName"
     _runs_filter_job_field[graphql_url] = field
     return field
+
+
+def _get_type_fields(
+    type_name: str,
+    env: str | None = None,
+    *,
+    input_type: bool = False,
+) -> frozenset[str]:
+    """Return GraphQL fields for a type, caching only valid introspection results."""
+    graphql_url, _, _ = _resolve_connection(env)
+    field_kind = "inputFields" if input_type else "fields"
+    cache_key = (graphql_url, type_name, field_kind)
+    if cache_key in _type_fields:
+        return _type_fields[cache_key]
+
+    query = """
+    query TypeFields($typeName: String!) {
+      __type(name: $typeName) {
+        fields { name }
+        inputFields { name }
+      }
+    }
+    """
+    data = gql(query, {"typeName": type_name}, env=env)
+    type_info = data.get("__type")
+    field_entries = type_info.get(field_kind) if isinstance(type_info, dict) else None
+    if not isinstance(field_entries, list) or any(
+        not isinstance(field, dict) or not isinstance(field.get("name"), str)
+        for field in field_entries
+    ):
+        raise RuntimeError(
+            f"Dagster returned invalid GraphQL introspection data for {type_name}.{field_kind}."
+        )
+
+    fields = frozenset(field["name"] for field in field_entries)
+    _type_fields[cache_key] = fields
+    return fields
+
+
+_RESOLVE_ASSET_SELECTION_SCHEMA = {
+    "Query": {"assetNodes"},
+    "AssetNode": {
+        "assetKey",
+        "groupName",
+        "tags",
+        "kinds",
+        "owners",
+        "dependencyKeys",
+        "jobNames",
+        "repository",
+        "isMaterializable",
+        "isExecutable",
+        "isObservable",
+        "isPartitioned",
+    },
+}
+_MATERIALIZE_ASSETS_SCHEMA = {
+    "Query": {
+        "assetNodes",
+        "assetNodeAdditionalRequiredKeys",
+        "assetNodeDefinitionCollisions",
+    },
+    "AssetNode": {
+        "assetKey",
+        "groupName",
+        "jobNames",
+        "isMaterializable",
+        "isExecutable",
+        "isObservable",
+        "isPartitioned",
+        "repository",
+        "assetChecksOrError",
+    },
+}
+
+
+def _dagster_19_compatibility_error(
+    tool_name: str,
+    required_fields: dict[str, set[str]],
+    env: str | None = None,
+) -> dict | None:
+    """Return a structured error when a Dagster 1.9+ tool lacks schema support."""
+    missing_fields = []
+    for type_name, required in required_fields.items():
+        available = _get_type_fields(type_name, env=env)
+        missing_fields.extend(
+            f"{type_name}.{field_name}" for field_name in sorted(required - available)
+        )
+    if not missing_fields:
+        return None
+    return {
+        "message": (
+            f"{tool_name} requires Dagster 1.9+; this instance is missing "
+            f"GraphQL fields: {', '.join(missing_fields)}."
+        )
+    }
 
 
 def gql(query: str, variables: dict | None = None, env: str | None = None) -> dict:
@@ -865,6 +955,87 @@ def search_assets(
 
 
 @mcp.tool()
+def resolve_asset_selection(asset_selection: str, env: str | None = None) -> dict:
+    """Resolve Dagster asset-selection syntax into concrete assets without launching a run.
+
+    Supported syntax:
+    - key predicates (``key:orders`` or bare ``orders``) with ``*`` wildcards
+    - ``group:``, ``tag:``, ``kind:``, and ``owner:`` predicates
+    - case-insensitive ``and``, ``or``, and ``not`` with parentheses
+    - ``roots(...)`` and ``sinks(...)``
+    - upstream/downstream traversal such as ``+orders``, ``2+orders``,
+      ``orders+``, ``orders+2``, or ``1+orders+2``
+
+    Returns ``asset_keys`` as slash-delimited strings ready to pass to
+    materialize_assets or backfill_assets, plus compact GraphQL-shaped asset
+    summaries. This tool is read-only and does not filter external, observable,
+    non-executable, or partitioned matches.
+    """
+    try:
+        parse_asset_selection(asset_selection)
+    except (AssetSelectionSyntaxError, TypeError) as exc:
+        return {
+            "selection": asset_selection,
+            "asset_keys": [],
+            "assets": [],
+            "message": str(exc),
+        }
+
+    compatibility_error = _dagster_19_compatibility_error(
+        "resolve_asset_selection",
+        _RESOLVE_ASSET_SELECTION_SCHEMA,
+        env=env,
+    )
+    if compatibility_error:
+        return compatibility_error
+
+    query = """
+    query AssetSelectionGraph {
+      assetNodes {
+        assetKey { path }
+        groupName
+        tags { key value }
+        kinds
+        owners {
+          __typename
+          ... on TeamAssetOwner { team }
+          ... on UserAssetOwner { email }
+        }
+        dependencyKeys { path }
+        jobNames
+        repository {
+          name
+          location { name }
+        }
+        isMaterializable
+        isExecutable
+        isObservable
+        isPartitioned
+      }
+    }
+    """
+    nodes = gql(query, env=env).get("assetNodes", [])
+    resolved = resolve_asset_selection_nodes(nodes, asset_selection)
+
+    fields = (
+        "assetKey",
+        "groupName",
+        "repository",
+        "jobNames",
+        "isMaterializable",
+        "isExecutable",
+        "isObservable",
+        "isPartitioned",
+    )
+    assets = [{field: node.get(field) for field in fields} for node in resolved]
+    return {
+        "selection": asset_selection,
+        "asset_keys": ["/".join(node["assetKey"]["path"]) for node in resolved],
+        "assets": assets,
+    }
+
+
+@mcp.tool()
 def get_asset_health(asset_key_or_group: str, env: str | None = None) -> list[dict]:
     """Get a consolidated health view for a single asset or all assets in a group.
 
@@ -1428,6 +1599,333 @@ def list_backfills(limit: int = 10, env: str | None = None) -> list[dict]:
 # ── Actions ───────────────────────────────────────────────────────────────────
 
 
+def _asset_key_input(asset_key: str) -> dict:
+    return {"path": asset_key.split("/")}
+
+
+def _asset_node_key(node: dict) -> str:
+    return "/".join(node.get("assetKey", {}).get("path", []))
+
+
+def _get_materialization_asset_nodes(
+    asset_keys: list[str],
+    env: str | None = None,
+) -> list[dict]:
+    query = """
+    query MaterializationAssetNodes($assetKeys: [AssetKeyInput!]!) {
+      assetNodes(assetKeys: $assetKeys) {
+        assetKey { path }
+        groupName
+        jobNames
+        isMaterializable
+        isExecutable
+        isObservable
+        isPartitioned
+        repository {
+          name
+          location { name }
+        }
+        assetChecksOrError {
+          __typename
+          ... on AssetChecks {
+            checks {
+              name
+              jobNames
+            }
+          }
+        }
+      }
+    }
+    """
+    return gql(
+        query,
+        {"assetKeys": [_asset_key_input(key) for key in asset_keys]},
+        env=env,
+    ).get("assetNodes", [])
+
+
+def _get_materialization_requirements(
+    asset_keys: list[str],
+    env: str | None = None,
+) -> dict:
+    query = """
+    query MaterializationRequirements($assetKeys: [AssetKeyInput!]!) {
+      assetNodeAdditionalRequiredKeys(assetKeys: $assetKeys) {
+        path
+      }
+      assetNodeDefinitionCollisions(assetKeys: $assetKeys) {
+        assetKey { path }
+        repositories {
+          name
+          location { name }
+        }
+      }
+    }
+    """
+    return gql(
+        query,
+        {"assetKeys": [_asset_key_input(key) for key in asset_keys]},
+        env=env,
+    )
+
+
+def _collision_message(collisions: list[dict]) -> str:
+    details = []
+    for collision in collisions:
+        key = "/".join(collision.get("assetKey", {}).get("path", []))
+        repositories = ", ".join(
+            f"{repository.get('location', {}).get('name', '?')}/{repository.get('name', '?')}"
+            for repository in collision.get("repositories", [])
+        )
+        details.append(f"{key} ({repositories})")
+    return "Selected assets have definition collisions: " + "; ".join(details)
+
+
+def materialize_assets(
+    asset_keys: list[str],
+    run_config: dict | None = None,
+    tags: dict[str, str] | None = None,
+    env: str | None = None,
+) -> dict:
+    """Materialize concrete, unpartitioned asset keys with optional run configuration.
+
+    Use resolve_asset_selection first when starting from a Dagster selection
+    expression. This tool deliberately accepts only concrete slash-delimited
+    asset keys, then re-fetches their current definitions before launching.
+
+    The selected assets must be materializable, executable, unpartitioned,
+    defined in one repository, and share a common asset job. Dagster-required
+    neighbors from non-subsettable multi-assets are included automatically and
+    reported in ``required_asset_keys_added``.
+
+    For partitioned assets, pass the resolved keys to backfill_assets instead.
+    """
+    if not asset_keys:
+        return {"message": "asset_keys must contain at least one asset key."}
+    if any(not isinstance(key, str) or not key for key in asset_keys):
+        return {"message": "Every asset key must be a non-empty string."}
+    invalid_key_paths = sorted(
+        {
+            key
+            for key in asset_keys
+            if key.startswith("/")
+            or key.endswith("/")
+            or any(not segment for segment in key.split("/"))
+            or "*" in key
+        }
+    )
+    if invalid_key_paths:
+        return {
+            "message": (
+                "materialize_assets accepts concrete slash-delimited asset keys, "
+                "not selection expressions or empty path segments. Invalid keys: "
+                + ", ".join(invalid_key_paths)
+                + ". Use resolve_asset_selection first."
+            )
+        }
+
+    compatibility_error = _dagster_19_compatibility_error(
+        "materialize_assets",
+        _MATERIALIZE_ASSETS_SCHEMA,
+        env=env,
+    )
+    if compatibility_error:
+        return compatibility_error
+
+    requested_keys = sorted(set(asset_keys))
+    launched_key_set = set(requested_keys)
+    required_key_set: set[str] = set()
+    # Expand to a fixed point because a newly added non-subsettable multi-asset
+    # neighbor can introduce additional required neighbors of its own.
+    while True:
+        launched_keys = sorted(launched_key_set)
+        nodes = _get_materialization_asset_nodes(launched_keys, env=env)
+        nodes_by_key = {_asset_node_key(node): node for node in nodes}
+        missing_keys = sorted(set(launched_keys) - set(nodes_by_key))
+        if missing_keys:
+            return {
+                "asset_keys": launched_keys,
+                "required_asset_keys_added": sorted(required_key_set),
+                "message": f"Asset definitions were not found for: {', '.join(missing_keys)}.",
+            }
+
+        # Dagster's requirement and collision resolvers assume every key exists,
+        # so missing definitions must be rejected before calling them.
+        requirements = _get_materialization_requirements(launched_keys, env=env)
+        collisions = requirements.get("assetNodeDefinitionCollisions", [])
+        if collisions:
+            return {
+                "asset_keys": launched_keys,
+                "required_asset_keys_added": sorted(required_key_set),
+                "message": _collision_message(collisions),
+            }
+        additional_required_keys = {
+            "/".join(asset_key.get("path", []))
+            for asset_key in requirements.get("assetNodeAdditionalRequiredKeys", [])
+        } - launched_key_set
+        if not additional_required_keys:
+            break
+        required_key_set |= additional_required_keys
+        launched_key_set |= additional_required_keys
+
+    required_keys = sorted(required_key_set)
+
+    invalid_assets: list[str] = []
+    for key in launched_keys:
+        node = nodes_by_key[key]
+        if node.get("isPartitioned"):
+            reason = "partitioned; use backfill_assets"
+        elif node.get("isObservable"):
+            reason = "observable, not materializable"
+        elif not node.get("isMaterializable"):
+            reason = "external or otherwise non-materializable"
+        elif not node.get("isExecutable"):
+            reason = "not executable"
+        else:
+            continue
+        invalid_assets.append(f"{key} ({reason})")
+    if invalid_assets:
+        return {
+            "asset_keys": launched_keys,
+            "required_asset_keys_added": required_keys,
+            "message": "Cannot materialize selected assets: " + "; ".join(invalid_assets),
+        }
+
+    repositories = {
+        (
+            node.get("repository", {}).get("location", {}).get("name") or "(unknown)",
+            node.get("repository", {}).get("name") or "(unknown)",
+        )
+        for node in nodes_by_key.values()
+    }
+    if len(repositories) != 1:
+        details = ", ".join(
+            f"{location}/{repository}" for location, repository in sorted(repositories)
+        )
+        return {
+            "asset_keys": launched_keys,
+            "required_asset_keys_added": required_keys,
+            "message": (
+                "Assets must be defined in one repository to launch a single run. "
+                f"Found: {details}."
+            ),
+        }
+    repository_location, repository_name = next(iter(repositories))
+
+    # GraphQL asset launches still target a named job, so every selected asset
+    # must belong to at least one job in common.
+    common_jobs: set[str] | None = None
+    jobs_by_asset: list[str] = []
+    for key in launched_keys:
+        jobs = set(nodes_by_key[key].get("jobNames") or [])
+        common_jobs = jobs if common_jobs is None else common_jobs & jobs
+        jobs_by_asset.append(f"{key}: {', '.join(sorted(jobs)) or '(none)'}")
+    if not common_jobs:
+        return {
+            "asset_keys": launched_keys,
+            "required_asset_keys_added": required_keys,
+            "message": (
+                "Selected assets do not share a common job. "
+                + "; ".join(jobs_by_asset)
+            ),
+        }
+
+    # Prefer Dagster's implicit asset job for ad hoc materialization, then use
+    # deterministic name ordering when several compatible jobs remain.
+    job_name = min(
+        common_jobs,
+        key=lambda name: (
+            0 if name == "__ASSET_JOB" else 1 if name.startswith("__ASSET_JOB") else 2,
+            name,
+        ),
+    )
+
+    # Explicitly select only checks that can execute in the chosen asset job.
+    asset_check_selection: list[dict] = []
+    seen_checks: set[tuple[str, str]] = set()
+    for key in launched_keys:
+        checks_or_error = nodes_by_key[key].get("assetChecksOrError") or {}
+        if checks_or_error.get("__typename") != "AssetChecks":
+            continue
+        for check in checks_or_error.get("checks", []):
+            check_jobs = check.get("jobNames") or []
+            check_name = check.get("name")
+            if not check_name or (check_jobs and job_name not in check_jobs):
+                continue
+            check_key = (key, check_name)
+            if check_key in seen_checks:
+                continue
+            seen_checks.add(check_key)
+            asset_check_selection.append(
+                {
+                    "assetKey": _asset_key_input(key),
+                    "name": check_name,
+                }
+            )
+
+    execution_metadata = None
+    if tags:
+        execution_metadata = {
+            "tags": [{"key": key, "value": value} for key, value in tags.items()]
+        }
+
+    mutation = """
+    mutation MaterializeAssets(
+      $locationName: String!,
+      $repoName: String!,
+      $jobName: String!,
+      $assetSelection: [AssetKeyInput!]!,
+      $assetCheckSelection: [AssetCheckHandleInput!],
+      $executionMetadata: ExecutionMetadata,
+      $runConfigData: RunConfigData
+    ) {
+      launchRun(executionParams: {
+        selector: {
+          repositoryLocationName: $locationName,
+          repositoryName: $repoName,
+          jobName: $jobName,
+          assetSelection: $assetSelection,
+          assetCheckSelection: $assetCheckSelection
+        },
+        runConfigData: $runConfigData,
+        executionMetadata: $executionMetadata
+      }) {
+        ... on LaunchRunSuccess { run { runId status } }
+        ... on InvalidSubsetError { message }
+        ... on PythonError { message }
+        ... on PresetNotFoundError { message }
+        ... on ConflictingExecutionParamsError { message }
+        ... on RunConfigValidationInvalid { errors { message } }
+      }
+    }
+    """
+    launch_result = gql(
+        mutation,
+        {
+            "locationName": repository_location,
+            "repoName": repository_name,
+            "jobName": job_name,
+            "assetSelection": [_asset_key_input(key) for key in launched_keys],
+            "assetCheckSelection": asset_check_selection,
+            "runConfigData": run_config or {},
+            "executionMetadata": execution_metadata,
+        },
+        env=env,
+    ).get("launchRun", {})
+
+    result = {
+        "job_name": job_name,
+        "repository_location": repository_location,
+        "repository_name": repository_name,
+        "requested_asset_keys": requested_keys,
+        "asset_keys": launched_keys,
+        "launched_asset_keys": launched_keys,
+        "required_asset_keys_added": required_keys,
+    }
+    result.update(launch_result)
+    return result
+
+
 def terminate_run(run_id: str, env: str | None = None) -> dict:
     """Terminate a running or queued Dagster run.
 
@@ -1464,6 +1962,10 @@ def launch_job(
 ) -> dict:
     """Launch a job or materialize specific assets. Use list_jobs first to find valid names.
 
+    For new asset-centric workflows, prefer resolve_asset_selection followed by
+    materialize_assets. ``asset_keys`` remains supported for compatibility and
+    is sent to Dagster as an asset selection, not an op selection.
+
     Required parameters:
     - job_name: name of the job (from list_jobs, e.g. 'my_etl_job')
     - repository_location: code location name (from list_jobs, e.g. 'my_project')
@@ -1492,16 +1994,18 @@ def launch_job(
     if tags:
         execution_metadata["tags"] = [{"key": k, "value": v} for k, v in tags.items()]
 
-    solid_selection: list[str] | None = None
-    if asset_keys:
-        solid_selection = asset_keys
+    asset_selection = (
+        [_asset_key_input(asset_key) for asset_key in asset_keys]
+        if asset_keys
+        else None
+    )
 
     query = """
     mutation LaunchJob(
       $locationName: String!,
       $repoName: String!,
       $jobName: String!,
-      $solidSelection: [String!],
+      $assetSelection: [AssetKeyInput!],
       $executionMetadata: ExecutionMetadata,
       $runConfigData: RunConfigData
     ) {
@@ -1510,7 +2014,7 @@ def launch_job(
           repositoryLocationName: $locationName,
           repositoryName: $repoName,
           jobName: $jobName,
-          solidSelection: $solidSelection
+          assetSelection: $assetSelection
         },
         runConfigData: $runConfigData,
         executionMetadata: $executionMetadata
@@ -1528,7 +2032,7 @@ def launch_job(
         "locationName": repository_location,
         "repoName": repository_name,
         "jobName": job_name,
-        "solidSelection": solid_selection,
+        "assetSelection": asset_selection,
         "runConfigData": run_config or {},
         "executionMetadata": execution_metadata or None,
     }
@@ -1609,6 +2113,7 @@ def launch_job_with_partitions(
     return data.get("launchPartitionBackfill", {})
 
 
+# ``run_config`` follows ``env`` to preserve the existing positional call signature.
 def backfill_assets(
     asset_keys: list[str],
     partition_start: str | None = None,
@@ -1616,6 +2121,7 @@ def backfill_assets(
     partition_keys: list[str] | None = None,
     tags: dict[str, str] | None = None,
     env: str | None = None,
+    run_config: dict | None = None,
 ) -> dict:
     """Launch a partition backfill for specific ASSETS (asset selection, not job).
 
@@ -1644,10 +2150,27 @@ def backfill_assets(
       (e.g. '2026-05-25' for daily).
     - partition_keys: explicit key list; overrides partition_start/end.
     - tags: extra run tags, e.g. {'triggered_by': 'dataops_agent'}.
+    - run_config: dict of run configuration applied to the backfill runs.
+      This is the same structure used in the Dagster Launchpad.
 
     Returns {'backfillId': ...} on success or {'message': <error>} on failure.
     Monitor with list_backfills; runs carry the dagster/backfill tag.
     """
+    if run_config is not None:
+        input_fields = _get_type_fields(
+            "LaunchBackfillParams",
+            env=env,
+            input_type=True,
+        )
+        if "runConfigData" not in input_fields:
+            return {
+                "message": (
+                    "This Dagster instance does not expose "
+                    "LaunchBackfillParams.runConfigData, so configured asset "
+                    "backfills are not supported by its GraphQL API."
+                )
+            }
+
     if partition_keys is None:
         query = """
         query AssetPartitionKeys($assetKeys: [AssetKeyInput!]!) {
@@ -1666,7 +2189,7 @@ def backfill_assets(
             return {
                 "message": (
                     f"Asset '{asset_keys[0]}' is not partitioned (or not found) — "
-                    "use launch_job for unpartitioned assets."
+                    "use materialize_assets for unpartitioned assets."
                 )
             }
 
@@ -1717,13 +2240,14 @@ def backfill_assets(
       }
     }
     """
-    variables = {
-        "backfillParams": {
-            "assetSelection": [{"path": k.split("/")} for k in asset_keys],
-            "partitionNames": partition_keys,
-            "tags": tag_list,
-        }
+    backfill_params = {
+        "assetSelection": [_asset_key_input(key) for key in asset_keys],
+        "partitionNames": partition_keys,
+        "tags": tag_list,
     }
+    if run_config is not None:
+        backfill_params["runConfigData"] = run_config
+    variables = {"backfillParams": backfill_params}
     data = gql(query, variables, env=env)
     return data.get("launchPartitionBackfill", {})
 
@@ -1734,6 +2258,7 @@ if not READ_ONLY:
     mcp.tool()(reload_code_location)
     mcp.tool()(terminate_run)
     mcp.tool()(launch_job)
+    mcp.tool()(materialize_assets)
     mcp.tool()(launch_job_with_partitions)
     mcp.tool()(backfill_assets)
 

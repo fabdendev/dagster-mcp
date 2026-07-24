@@ -33,16 +33,16 @@ Agent: Re-launching the failed job...
 
 ## What it does
 
-21 tools across 6 categories, designed for autonomous DataOps workflows:
+23 tools across 6 categories, designed for autonomous DataOps workflows:
 
 | Category | Tools | What an agent can do |
 |----------|-------|---------------------|
 | **Runs** | `get_runs` `get_run_status` `get_run_logs` `get_run_stats` `get_run_failure_summary` | Find failures, diagnose root causes, inspect logs and step timing |
-| **Assets** | `search_assets` `get_asset_details` `get_recent_materializations` `get_asset_health` | Discover assets, check freshness, detect stale data |
+| **Assets** | `search_assets` `resolve_asset_selection` `get_asset_details` `get_recent_materializations` `get_asset_health` | Discover assets, preview lineage selections, check freshness, detect stale data |
 | **Jobs** | `list_jobs` | Inventory all jobs across code locations |
 | **Schedules & Sensors** | `list_schedules` `list_sensors` `get_tick_history` | Detect silent failures, missed ticks, sensor errors |
 | **Instance** | `get_instance_status` `list_code_locations` `list_backfills` | Global health check, daemon status, code location errors |
-| **Actions** | `launch_job` `launch_job_with_partitions` `backfill_assets` `terminate_run` `reload_code_location` | Re-run failed jobs, backfill partitions (job or asset selection), stop stuck runs, reload after deploy |
+| **Actions** | `materialize_assets` `backfill_assets` `launch_job` `launch_job_with_partitions` `terminate_run` `reload_code_location` | Materialize concrete assets with config, backfill partitions, launch jobs, stop stuck runs, reload after deploy |
 
 > Actions are opt-in: set `DAGSTER_READ_ONLY=false` to enable write operations.
 
@@ -227,9 +227,60 @@ Add to `claude_desktop_config.json`:
 | Tool | Description |
 |------|-------------|
 | `search_assets` | Discover assets by key prefix or group name |
+| `resolve_asset_selection` | Resolve key/group/tag/kind/owner predicates, wildcards, boolean logic, roots/sinks, and lineage traversal into concrete asset keys without launching anything |
 | `get_asset_details` | Get description, upstream/downstream dependencies, partitions, latest materialization |
 | `get_recent_materializations` | Get materialization history with metadata for an asset |
 | `get_asset_health` | **Consolidated health view** — staleness, freshness policy, last run status (works with single asset or entire group) |
+
+#### Two-step asset workflow
+
+Start by resolving and reviewing a selection expression:
+
+```text
+resolve_asset_selection(
+  asset_selection="group:analytics and (kind:dbt or key:*benchmark)"
+)
+
+→ {
+    "asset_keys": [
+      "warehouse/analytics/orders",
+      "warehouse/analytics/reranker_benchmark"
+    ],
+    "assets": [...]
+  }
+```
+
+For concrete, unpartitioned assets, pass the returned keys to
+`materialize_assets` with any required launch config and tags:
+
+```text
+materialize_assets(
+  asset_keys=[
+    "warehouse/analytics/orders",
+    "warehouse/analytics/reranker_benchmark"
+  ],
+  run_config={"ops": {"benchmark": {"config": {"limit": 1000}}}},
+  tags={"triggered_by": "agent"}
+)
+```
+
+For partitioned assets, pass the same resolved keys to `backfill_assets`
+instead:
+
+```text
+backfill_assets(
+  asset_keys=["warehouse/analytics/daily_orders"],
+  partition_start="2026-07-01",
+  partition_end="2026-07-07",
+  run_config={"resources": {"warehouse": {"config": {"pool": "benchmark"}}}}
+)
+```
+
+`resolve_asset_selection` is available in both read-only and read-write modes.
+It returns external, observable, non-executable, and partitioned matches so the
+caller can inspect the complete result. The write tools re-fetch current asset
+definitions before execution. `resolve_asset_selection` and `materialize_assets`
+require Dagster 1.9+.
 
 ### Jobs, Schedules & Sensors
 
@@ -252,9 +303,10 @@ Add to `claude_desktop_config.json`:
 
 | Tool | Description |
 |------|-------------|
-| `launch_job` | Launch a job or materialize specific assets (supports tags and asset selection) |
+| `materialize_assets` | Launch concrete, unpartitioned asset keys with run config and tags; infers one compatible repository/job, includes compatible checks, and expands required non-subsettable multi-asset neighbors |
+| `backfill_assets` | Launch a partition backfill by **asset selection** with optional run config; respects each asset's `BackfillPolicy` server-side |
+| `launch_job` | Launch a named job; `asset_keys` remains supported for compatibility and is sent through GraphQL `assetSelection`, but the two-step asset workflow is preferred |
 | `launch_job_with_partitions` | Launch a partitioned job for one or more partition keys; creates a backfill (supports `from_failure` to retry only failed steps) |
-| `backfill_assets` | Launch a partition backfill by **asset selection** (like the UI's "Materialize → partition range"); respects each asset's `BackfillPolicy` server-side. Use for assets inside a multi-asset/dbt op or with `single_run()` policy |
 | `terminate_run` | Stop a stuck or runaway run |
 | `reload_code_location` | Reload a code location after deploy |
 
@@ -272,14 +324,20 @@ They serve different purposes and work well together.
 
 ## Compatibility
 
-Tested with Dagster 1.6+. The `RunsFilter` field name (`jobName` vs `pipelineName`) is auto-detected via schema introspection, so the server works across all Dagster versions without configuration.
+The monitoring and existing action tools are tested with Dagster 1.6+.
+`resolve_asset_selection` and `materialize_assets` require Dagster 1.9+ and
+verify the required GraphQL capabilities before querying or launching. The
+`RunsFilter` field name (`jobName` vs `pipelineName`) is auto-detected via schema
+introspection. Configured asset backfills also feature-detect
+`LaunchBackfillParams.runConfigData` and return a clear compatibility error when
+an older schema does not expose it.
 
 ## Development
 
 ```bash
 uv sync --extra dev
 uv run ruff check dagster_mcp/    # lint
-uv run pytest                     # tests (118 tests)
+uv run pytest                     # run the test suite
 uv run python -m dagster_mcp      # start server locally
 ```
 

@@ -5,7 +5,6 @@ import httpx
 
 from dagster_mcp.server import (
     get_runs, get_run_status, get_run_logs, get_run_stats, get_run_failure_summary,
-    _runs_filter_job_field,
 )
 
 
@@ -68,15 +67,22 @@ class TestGetRuns:
         assert mock_post.call_count == 3  # 1 introspection + 2 queries
 
     def test_introspection_fallback_on_error(self, monkeypatch):
-        """If introspection fails, fall back to jobName."""
+        """If introspection fails, fall back to jobName without caching it."""
         mock_post = MagicMock(side_effect=[
             Exception("connection refused"),
+            _mock_response({"data": {"runsOrError": {"results": []}}}),
+            _mock_response({"data": {"__type": {"inputFields": [
+                {"name": "pipelineName"}, {"name": "statuses"},
+            ]}}}),
             _mock_response({"data": {"runsOrError": {"results": []}}}),
         ])
         monkeypatch.setattr(httpx, "post", mock_post)
         get_runs(job_name="my_job")
-        query_payload = mock_post.call_args_list[1].kwargs["json"]
-        assert query_payload["variables"]["filter"]["jobName"] == "my_job"
+        get_runs(job_name="my_job")
+        first_query = mock_post.call_args_list[1].kwargs["json"]
+        second_query = mock_post.call_args_list[3].kwargs["json"]
+        assert first_query["variables"]["filter"]["jobName"] == "my_job"
+        assert second_query["variables"]["filter"]["pipelineName"] == "my_job"
 
     def test_with_statuses(self, mock_gql):
         mock_post = mock_gql({"data": {"runsOrError": {"results": []}}})
