@@ -370,7 +370,11 @@ class _GraphEvaluator:
         for owner in node.get("owners") or []:
             if isinstance(owner, str):
                 values.add(owner)
-            elif owner.get("__typename") == "TeamAssetOwner" and owner.get("team") is not None:
+                continue
+            if not isinstance(owner, dict):
+                # Defensive: GraphQL should only return strings or owner objects.
+                continue
+            if owner.get("__typename") == "TeamAssetOwner" and owner.get("team") is not None:
                 # GraphQL returns the bare team name; selection syntax uses ``team:<name>``.
                 values.add(f"team:{owner['team']}")
             elif owner.get("email") is not None:
@@ -405,10 +409,15 @@ class _GraphEvaluator:
         return result
 
 
-def resolve_asset_selection_nodes(nodes: list[dict], query: str) -> list[dict]:
-    """Resolve ``query`` against GraphQL AssetNode dictionaries."""
+def evaluate_asset_selection(nodes: list[dict], expression: _Expression) -> list[dict]:
+    """Resolve an already-parsed selection against GraphQL AssetNode dictionaries."""
 
-    expression = parse_asset_selection(query)
     evaluator = _GraphEvaluator(nodes)
     selected_keys = evaluator.evaluate(expression)
     return [evaluator.nodes_by_key[key] for key in sorted(selected_keys)]
+
+
+def resolve_asset_selection_nodes(nodes: list[dict], query: str) -> list[dict]:
+    """Parse ``query`` and resolve it against GraphQL AssetNode dictionaries."""
+
+    return evaluate_asset_selection(nodes, parse_asset_selection(query))
