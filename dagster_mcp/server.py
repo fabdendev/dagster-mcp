@@ -8,8 +8,8 @@ from fastmcp import FastMCP
 
 from dagster_mcp.asset_selection import (
     AssetSelectionSyntaxError,
+    evaluate_asset_selection,
     parse_asset_selection,
-    resolve_asset_selection_nodes,
 )
 
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://localhost:3000")
@@ -972,7 +972,7 @@ def resolve_asset_selection(asset_selection: str, env: str | None = None) -> dic
     non-executable, or partitioned matches.
     """
     try:
-        parse_asset_selection(asset_selection)
+        expression = parse_asset_selection(asset_selection)
     except (AssetSelectionSyntaxError, TypeError) as exc:
         return {
             "selection": asset_selection,
@@ -1015,7 +1015,17 @@ def resolve_asset_selection(asset_selection: str, env: str | None = None) -> dic
     }
     """
     nodes = gql(query, env=env).get("assetNodes", [])
-    resolved = resolve_asset_selection_nodes(nodes, asset_selection)
+    try:
+        resolved = evaluate_asset_selection(nodes, expression)
+    except Exception as exc:
+        # Evaluation-time failures (e.g. unexpected node shape) return a
+        # structured message rather than an unhandled tool error.
+        return {
+            "selection": asset_selection,
+            "asset_keys": [],
+            "assets": [],
+            "message": f"Failed to evaluate selection: {exc}",
+        }
 
     fields = (
         "assetKey",

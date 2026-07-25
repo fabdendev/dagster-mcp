@@ -154,6 +154,18 @@ class TestAssetSelectionParser:
             resolve_asset_selection_nodes(asset_nodes, 'tag:"priority"="high"')
         ) == ["warehouse/raw_orders"]
 
+    def test_malformed_owner_entry_does_not_crash(self):
+        # A non-str/non-dict owner element must be skipped, not raise AttributeError.
+        nodes = [
+            {"assetKey": {"path": ["a"]}, "owners": [None, {}, "alice"]},
+            {"assetKey": {"path": ["b"]}, "owners": [{"__typename": "UserAssetOwner",
+                                                      "email": "bob@example.com"}]},
+        ]
+        assert _keys(resolve_asset_selection_nodes(nodes, "owner:alice")) == ["a"]
+        assert _keys(
+            resolve_asset_selection_nodes(nodes, 'owner:"bob@example.com"')
+        ) == ["b"]
+
     def test_upstream_and_downstream_traversals(self, asset_nodes):
         assert _keys(
             resolve_asset_selection_nodes(asset_nodes, "+key:warehouse/order_report")
@@ -261,6 +273,20 @@ class TestResolveAssetSelectionTool:
         assert result["assets"] == []
         assert "position" in result["message"]
         mock_post.assert_not_called()
+
+    def test_evaluation_error_is_structured(self, mock_gql, asset_nodes, monkeypatch):
+        mock_gql({"data": {"assetNodes": asset_nodes}})
+
+        def _boom(nodes, expression):
+            raise RuntimeError("unexpected node shape")
+
+        monkeypatch.setattr(server_module, "evaluate_asset_selection", _boom)
+
+        result = resolve_asset_selection("group:analytics")
+
+        assert result["asset_keys"] == []
+        assert result["assets"] == []
+        assert "Failed to evaluate selection" in result["message"]
 
 
 def _mock_response(data):
