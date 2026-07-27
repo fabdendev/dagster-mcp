@@ -10,6 +10,7 @@ import pytest
 from dagster_mcp import server as server_module
 from dagster_mcp.server import (
     backfill_assets,
+    get_tick_history,
     launch_job,
     launch_job_with_partitions,
     materialize_assets,
@@ -1187,6 +1188,94 @@ class TestMutationSchemaCompatibility:
         assert "SensorNotFoundError" not in query
         assert "UnauthorizedError" not in query
         assert "PythonError" not in query
+
+
+class TestLocateQueryWeight:
+    """Instigation state is resolved per instigator, so only ask when needed."""
+
+    @pytest.mark.parametrize(
+        "fn,name,field,mutation,success",
+        [
+            (start_schedule, "daily", "schedules", "startSchedule",
+             {"__typename": "ScheduleStateResult",
+              "scheduleState": {"status": "RUNNING"}}),
+            (start_sensor, "s", "sensors", "startSensor",
+             {"__typename": "Sensor", "name": "s",
+              "sensorState": {"status": "RUNNING"}}),
+        ],
+    )
+    def test_start_tools_do_not_resolve_instigation_state(
+        self, fn, name, field, mutation, success, monkeypatch
+    ):
+        mock_post = MagicMock(side_effect=[
+            _mock_response({"data": {"repositoriesOrError": _locate_payload(name, field)}}),
+            _mock_response({"data": {mutation: success}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        fn(name)
+        locate_query = mock_post.call_args_list[0].kwargs["json"]["query"]
+        assert "scheduleState" not in locate_query
+        assert "sensorState" not in locate_query
+
+    def test_get_tick_history_does_not_resolve_instigation_state(self, monkeypatch):
+        mock_post = MagicMock(side_effect=[
+            _mock_response({"data": {
+                "repositoriesOrError": _locate_payload("daily", "schedules"),
+            }}),
+            _mock_response({"data": {"instigationStateOrError": {
+                "__typename": "InstigationState", "ticks": [],
+            }}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        get_tick_history("daily", "SCHEDULE")
+        locate_query = mock_post.call_args_list[0].kwargs["json"]["query"]
+        assert "scheduleState" not in locate_query
+        assert "sensorState" not in locate_query
+
+    @pytest.mark.parametrize(
+        "fn,name,field,state_key",
+        [
+            (stop_schedule, "daily", "schedules", "scheduleState"),
+            (stop_sensor, "s", "sensors", "sensorState"),
+        ],
+    )
+    def test_stop_tools_do_resolve_instigation_state(
+        self, fn, name, field, state_key, mock_gql
+    ):
+        mock_post = mock_gql({"data": {
+            "repositoriesOrError": _locate_payload(name, field),
+            "stopRunningSchedule": {"__typename": "ScheduleStateResult",
+                                    "scheduleState": {"status": "STOPPED"}},
+            "stopSensor": {"__typename": "StopSensorMutationResult",
+                           "instigationState": {"status": "STOPPED"}},
+        }})
+        fn(name)
+        locate_query = mock_post.call_args_list[0].kwargs["json"]["query"]
+        assert f"{state_key} {{ id selectorId }}" in locate_query
+
+
+class TestStopWhenAlreadyStopped:
+    """Stopping an already-stopped instigator is reported, not treated as failure."""
+
+    def test_schedule_already_stopped(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules", status="STOPPED"),
+            "stopRunningSchedule": {"__typename": "ScheduleStateResult",
+                                    "scheduleState": {"status": "STOPPED"}},
+        }})
+        result = stop_schedule("daily")
+        assert result["status"] == "STOPPED"
+        assert "stopped" in result["message"]
+
+    def test_sensor_already_stopped(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors", status="STOPPED"),
+            "stopSensor": {"__typename": "StopSensorMutationResult",
+                           "instigationState": {"status": "STOPPED"}},
+        }})
+        result = stop_sensor("s")
+        assert result["status"] == "STOPPED"
+        assert "stopped" in result["message"]
 
 
 class TestReadOnlyGating:

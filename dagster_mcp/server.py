@@ -1324,16 +1324,23 @@ def _locate_instigators(
     repository_name: str | None = None,
     location_name: str | None = None,
     env: str | None = None,
+    include_state: bool = False,
 ) -> list[dict]:
     """Locate every schedule/sensor matching a name across all repositories.
 
     Returns a list of {"repositoryName", "repositoryLocationName", "name",
-    "state"} where "state" is the InstigationState ({id, selectorId, status})
-    or {}. Instigator names are only unique within a repository, so several
-    code locations may expose the same name; callers must handle >1 match.
-    repository_name / location_name narrow the search when given.
-    instigator_type must already be upper-cased and validated.
+    "state"} where "state" is the InstigationState ({id, selectorId}) when
+    include_state is set, else {}. Instigator names are only unique within a
+    repository, so several code locations may expose the same name; callers
+    must handle >1 match. repository_name / location_name narrow the search
+    when given. instigator_type must already be upper-cased and validated.
+
+    Resolving instigation state hits the instance storage for every schedule
+    and sensor in the workspace, so only the stop tools — which need the
+    origin/selector ids — ask for it.
     """
+    state_fields = " scheduleState { id selectorId }" if include_state else ""
+    sensor_state_fields = " sensorState { id selectorId }" if include_state else ""
     locate = """
     query Locate {
       repositoriesOrError {
@@ -1341,14 +1348,14 @@ def _locate_instigators(
           nodes {
             name
             location { name }
-            schedules { name scheduleState { id selectorId status } }
-            sensors { name sensorState { id selectorId status } }
+            schedules { name%s }
+            sensors { name%s }
           }
         }
         ... on PythonError { message }
       }
     }
-    """
+    """ % (state_fields, sensor_state_fields)
     repos = gql(locate, env=env).get("repositoriesOrError", {}).get("nodes", [])
     field = "schedules" if instigator_type == "SCHEDULE" else "sensors"
     state_key = "scheduleState" if instigator_type == "SCHEDULE" else "sensorState"
@@ -1379,11 +1386,13 @@ def _resolve_instigator(
     repository_name: str | None = None,
     location_name: str | None = None,
     env: str | None = None,
+    include_state: bool = False,
 ) -> tuple[dict | None, dict | None]:
     """Resolve a name to exactly one instigator.
 
     Returns (located, None) on a unique match, or (None, error_dict) when the
     instigator is missing or ambiguous across code locations. Never mutates.
+    Pass include_state when the caller needs the instigation-state ids.
     """
     matches = _locate_instigators(
         instigator_name,
@@ -1391,6 +1400,7 @@ def _resolve_instigator(
         repository_name=repository_name,
         location_name=location_name,
         env=env,
+        include_state=include_state,
     )
     kind = instigator_type.capitalize()
     if not matches:
@@ -1625,6 +1635,7 @@ def stop_schedule(
         repository_name=repository_name,
         location_name=location_name,
         env=env,
+        include_state=True,
     )
     if error is not None:
         return error
@@ -1770,6 +1781,7 @@ def stop_sensor(
         repository_name=repository_name,
         location_name=location_name,
         env=env,
+        include_state=True,
     )
     if error is not None:
         return error
