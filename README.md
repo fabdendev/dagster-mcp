@@ -29,6 +29,12 @@ Agent: Diagnosing the most recent failure...
 
 Agent: Re-launching the failed job...
        launch_job("etl_pipeline", "my_project") -> run_id: "run_def456", status: STARTED
+
+Agent: One sensor keeps firing on bad data. Checking its ticks...
+       get_tick_history("orders_sensor", "SENSOR") -> 12 consecutive FAILURE ticks
+
+Agent: Stopping it until the upstream fix lands...
+       stop_sensor("orders_sensor") -> status: STOPPED
 ```
 
 ## What it does
@@ -289,7 +295,7 @@ require Dagster 1.9+.
 | `list_jobs` | List all jobs across all code locations (use to find names for `launch_job`) |
 | `list_schedules` | List schedules with status (RUNNING/STOPPED), cron, target job, next tick |
 | `list_sensors` | List sensors with status and target jobs |
-| `get_tick_history` | Tick-by-tick history for a schedule or sensor — **essential for detecting silent failures** |
+| `get_tick_history` | Tick-by-tick history for a schedule or sensor — **essential for detecting silent failures**. Accepts optional `repository_name` / `location_name` to disambiguate a name shared by several code locations |
 
 ### Instance & Code Locations
 
