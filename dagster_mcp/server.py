@@ -1310,18 +1310,147 @@ def list_sensors(env: str | None = None) -> list[dict]:
     return result
 
 
+def _normalize_instigator_type(value: str) -> str:
+    """Upper-case and validate an instigator type ('SCHEDULE' or 'SENSOR')."""
+    normalized = value.upper()
+    if normalized not in ("SCHEDULE", "SENSOR"):
+        raise ValueError("instigator_type must be 'SCHEDULE' or 'SENSOR'.")
+    return normalized
+
+
+def _locate_instigators(
+    instigator_name: str,
+    instigator_type: str,
+    repository_name: str | None = None,
+    location_name: str | None = None,
+    env: str | None = None,
+    include_state: bool = False,
+) -> list[dict]:
+    """Locate every schedule/sensor matching a name across all repositories.
+
+    Returns a list of {"repositoryName", "repositoryLocationName", "name",
+    "state"} where "state" is the InstigationState ({id, selectorId}) when
+    include_state is set, else {}. Instigator names are only unique within a
+    repository, so several code locations may expose the same name; callers
+    must handle >1 match. repository_name / location_name narrow the search
+    when given. instigator_type must already be upper-cased and validated.
+
+    Resolving instigation state hits the instance storage for every schedule
+    and sensor in the workspace, so only the stop tools — which need the
+    origin/selector ids — ask for it.
+    """
+    state_fields = " scheduleState { id selectorId }" if include_state else ""
+    sensor_state_fields = " sensorState { id selectorId }" if include_state else ""
+    locate = """
+    query Locate {
+      repositoriesOrError {
+        ... on RepositoryConnection {
+          nodes {
+            name
+            location { name }
+            schedules { name%s }
+            sensors { name%s }
+          }
+        }
+        ... on PythonError { message }
+      }
+    }
+    """ % (state_fields, sensor_state_fields)
+    repos = gql(locate, env=env).get("repositoriesOrError", {}).get("nodes", [])
+    field = "schedules" if instigator_type == "SCHEDULE" else "sensors"
+    state_key = "scheduleState" if instigator_type == "SCHEDULE" else "sensorState"
+    matches = []
+    for repo in repos:
+        repo_name = repo["name"]
+        loc_name = repo["location"]["name"]
+        if repository_name is not None and repo_name != repository_name:
+            continue
+        if location_name is not None and loc_name != location_name:
+            continue
+        for item in repo.get(field, []):
+            if item.get("name") == instigator_name:
+                matches.append(
+                    {
+                        "repositoryName": repo_name,
+                        "repositoryLocationName": loc_name,
+                        "name": instigator_name,
+                        "state": item.get(state_key) or {},
+                    }
+                )
+    return matches
+
+
+def _resolve_instigator(
+    instigator_name: str,
+    instigator_type: str,
+    repository_name: str | None = None,
+    location_name: str | None = None,
+    env: str | None = None,
+    include_state: bool = False,
+) -> tuple[dict | None, dict | None]:
+    """Resolve a name to exactly one instigator.
+
+    Returns (located, None) on a unique match, or (None, error_dict) when the
+    instigator is missing or ambiguous across code locations. Never mutates.
+    Pass include_state when the caller needs the instigation-state ids.
+    """
+    matches = _locate_instigators(
+        instigator_name,
+        instigator_type,
+        repository_name=repository_name,
+        location_name=location_name,
+        env=env,
+        include_state=include_state,
+    )
+    kind = instigator_type.capitalize()
+    if not matches:
+        return None, {
+            "name": instigator_name,
+            "instigator_type": instigator_type,
+            "message": f"{kind} '{instigator_name}' not found.",
+        }
+    if len(matches) > 1:
+        candidates = [
+            {
+                "repository": m["repositoryName"],
+                "location": m["repositoryLocationName"],
+            }
+            for m in matches
+        ]
+        listed = ", ".join(
+            f"{c['location']}/{c['repository']}" for c in candidates
+        )
+        return None, {
+            "name": instigator_name,
+            "instigator_type": instigator_type,
+            "candidates": candidates,
+            "message": (
+                f"Ambiguous: {kind.lower()} '{instigator_name}' exists in "
+                f"{listed} — pass repository_name/location_name to "
+                "disambiguate. No change was made."
+            ),
+        }
+    return matches[0], None
+
+
+# ``repository_name``/``location_name`` follow ``env`` to preserve the existing
+# positional call signature.
 @mcp.tool()
 def get_tick_history(
     instigator_name: str,
     instigator_type: str,
     limit: int = 20,
     env: str | None = None,
+    repository_name: str | None = None,
+    location_name: str | None = None,
 ) -> dict:
     """Get recent tick history for a schedule or sensor — essential for detecting silent failures.
 
     - instigator_name: exact name of the schedule or sensor (from list_schedules/list_sensors)
     - instigator_type: 'SCHEDULE' or 'SENSOR'
     - limit: max ticks to return (default 20)
+    - repository_name / location_name: optional, to disambiguate when the same
+      name exists in several code locations (see list_schedules/list_sensors)
 
     Returns per tick: tick_id, status (SUCCESS/FAILURE/SKIPPED), timestamp,
     error message (if failed), and run_ids (runs launched by this tick).
@@ -1333,43 +1462,22 @@ def get_tick_history(
     - Ticks with SUCCESS but empty run_ids: sensor evaluated but decided not to launch
     - Missing ticks: daemon may be unhealthy (check get_instance_status)
     """
-    instigator_type = instigator_type.upper()
-    if instigator_type not in ("SCHEDULE", "SENSOR"):
-        raise ValueError("instigator_type must be 'SCHEDULE' or 'SENSOR'.")
+    instigator_type = _normalize_instigator_type(instigator_type)
 
     # Resolve repo + location for the named instigator (selector needs all three).
-    locate = """
-    query Locate {
-      repositoriesOrError {
-        ... on RepositoryConnection {
-          nodes {
-            name
-            location { name }
-            schedules { name }
-            sensors { name }
-          }
-        }
-        ... on PythonError { message }
-      }
+    located, error = _resolve_instigator(
+        instigator_name,
+        instigator_type,
+        repository_name=repository_name,
+        location_name=location_name,
+        env=env,
+    )
+    if error is not None:
+        return error
+    selector = {
+        key: located[key]
+        for key in ("repositoryName", "repositoryLocationName", "name")
     }
-    """
-    repos = gql(locate, env=env).get("repositoriesOrError", {}).get("nodes", [])
-    field = "schedules" if instigator_type == "SCHEDULE" else "sensors"
-    selector = None
-    for repo in repos:
-        if any(i["name"] == instigator_name for i in repo.get(field, [])):
-            selector = {
-                "repositoryName": repo["name"],
-                "repositoryLocationName": repo["location"]["name"],
-                "name": instigator_name,
-            }
-            break
-    if selector is None:
-        return {
-            "name": instigator_name,
-            "instigator_type": instigator_type,
-            "message": f"{instigator_type.capitalize()} '{instigator_name}' not found.",
-        }
 
     query = """
     query TickHistory($selector: InstigationSelector!, $limit: Int!) {
@@ -1411,6 +1519,310 @@ def get_tick_history(
             }
             for t in state.get("ticks", [])
         ],
+    }
+
+
+# ── Schedules & sensors (write) ───────────────────────────────────────────────
+
+
+def _missing_state_ids_message(kind: str, name: str) -> str:
+    return (
+        f"Could not resolve instigation state ids for {kind.lower()} "
+        f"'{name}'; this Dagster version may not expose "
+        "InstigationState.id/selectorId."
+    )
+
+
+def start_schedule(
+    schedule_name: str,
+    repository_name: str | None = None,
+    location_name: str | None = None,
+    env: str | None = None,
+) -> dict:
+    """Start (enable) a Dagster schedule so it launches runs on its cron interval.
+
+    - schedule_name: exact schedule name (from list_schedules)
+    - repository_name / location_name: optional, to disambiguate when the same
+      schedule name exists in several code locations
+    - env: optional environment key; defaults to the configured instance
+
+    Returns {name, instigator_type, repository, location, status} on success
+    (status is the new InstigationStatus, normally RUNNING). On failure returns
+    {name, instigator_type, message} — e.g. schedule not found, ambiguous
+    across code locations (nothing is changed), or the API token lacks the
+    START_SCHEDULE permission.
+
+    When to use: to re-enable a schedule that was previously stopped. This is
+    a persistent instance-level change that survives daemon restarts and code
+    reloads. Ticks missed while the schedule was stopped are NOT backfilled —
+    use backfill_assets or launch_job_with_partitions to catch up.
+    """
+    located, error = _resolve_instigator(
+        schedule_name,
+        "SCHEDULE",
+        repository_name=repository_name,
+        location_name=location_name,
+        env=env,
+    )
+    if error is not None:
+        return error
+
+    selector = {
+        "repositoryName": located["repositoryName"],
+        "repositoryLocationName": located["repositoryLocationName"],
+        "scheduleName": schedule_name,
+    }
+    query = """
+    mutation StartSchedule($selector: ScheduleSelector!) {
+      startSchedule(scheduleSelector: $selector) {
+        __typename
+        ... on ScheduleStateResult { scheduleState { id name status selectorId } }
+        ... on Error { message }
+      }
+    }
+    """
+    result = gql(query, {"selector": selector}, env=env).get("startSchedule", {})
+    typename = result.get("__typename")
+    if typename == "ScheduleStateResult":
+        state = result.get("scheduleState") or {}
+        return {
+            "name": schedule_name,
+            "instigator_type": "SCHEDULE",
+            "repository": located["repositoryName"],
+            "location": located["repositoryLocationName"],
+            "status": state.get("status"),
+            "message": f"Schedule '{schedule_name}' started.",
+        }
+    return {
+        "name": schedule_name,
+        "instigator_type": "SCHEDULE",
+        "repository": located["repositoryName"],
+        "location": located["repositoryLocationName"],
+        "message": result.get("message", f"Unknown error ({typename})."),
+    }
+
+
+def stop_schedule(
+    schedule_name: str,
+    repository_name: str | None = None,
+    location_name: str | None = None,
+    env: str | None = None,
+) -> dict:
+    """Stop (disable) a Dagster schedule so it stops launching runs on its cron.
+
+    - schedule_name: exact schedule name (from list_schedules)
+    - repository_name / location_name: optional, to disambiguate when the same
+      schedule name exists in several code locations
+    - env: optional environment key; defaults to the configured instance
+
+    Returns {name, instigator_type, repository, location, status} on success
+    (status is the new InstigationStatus, normally STOPPED). On failure returns
+    {name, instigator_type, message} — e.g. schedule not found, ambiguous
+    across code locations (nothing is stopped), or the API token lacks the
+    STOP_RUNNING_SCHEDULE permission.
+
+    When to use: to halt a schedule that is launching bad or unwanted runs.
+    This is a persistent instance-level change: the schedule stays stopped
+    across daemon restarts and code reloads until someone calls
+    start_schedule, and it overrides any default_status declared in code.
+    It does NOT terminate runs the schedule already launched — use
+    terminate_run for those. Cron ticks missed while stopped are never
+    backfilled when the schedule is restarted.
+    """
+    located, error = _resolve_instigator(
+        schedule_name,
+        "SCHEDULE",
+        repository_name=repository_name,
+        location_name=location_name,
+        env=env,
+        include_state=True,
+    )
+    if error is not None:
+        return error
+    state = located["state"]
+    if not state.get("id") or not state.get("selectorId"):
+        return {
+            "name": schedule_name,
+            "instigator_type": "SCHEDULE",
+            "repository": located["repositoryName"],
+            "location": located["repositoryLocationName"],
+            "message": _missing_state_ids_message("schedule", schedule_name),
+        }
+
+    query = """
+    mutation StopSchedule($originId: String!, $selectorId: String!) {
+      stopRunningSchedule(scheduleOriginId: $originId, scheduleSelectorId: $selectorId) {
+        __typename
+        ... on ScheduleStateResult { scheduleState { id name status selectorId } }
+        ... on Error { message }
+      }
+    }
+    """
+    variables = {"originId": state["id"], "selectorId": state["selectorId"]}
+    result = gql(query, variables, env=env).get("stopRunningSchedule", {})
+    typename = result.get("__typename")
+    if typename == "ScheduleStateResult":
+        new_state = result.get("scheduleState") or {}
+        return {
+            "name": schedule_name,
+            "instigator_type": "SCHEDULE",
+            "repository": located["repositoryName"],
+            "location": located["repositoryLocationName"],
+            "status": new_state.get("status"),
+            "message": f"Schedule '{schedule_name}' stopped.",
+        }
+    return {
+        "name": schedule_name,
+        "instigator_type": "SCHEDULE",
+        "repository": located["repositoryName"],
+        "location": located["repositoryLocationName"],
+        "message": result.get("message", f"Unknown error ({typename})."),
+    }
+
+
+def start_sensor(
+    sensor_name: str,
+    repository_name: str | None = None,
+    location_name: str | None = None,
+    env: str | None = None,
+) -> dict:
+    """Start (enable) a Dagster sensor so it resumes evaluating and launching runs.
+
+    - sensor_name: exact sensor name (from list_sensors)
+    - repository_name / location_name: optional, to disambiguate when the same
+      sensor name exists in several code locations
+    - env: optional environment key; defaults to the configured instance
+
+    Returns {name, instigator_type, repository, location, status} on success
+    (status is the new InstigationStatus, normally RUNNING). On failure returns
+    {name, instigator_type, message} — e.g. sensor not found, ambiguous across
+    code locations (nothing is changed), or the API token lacks the
+    EDIT_SENSOR permission.
+
+    When to use: to re-enable a sensor that was previously stopped once the
+    underlying issue is fixed. This is a persistent instance-level change that
+    survives daemon restarts and code reloads. Use get_tick_history afterwards
+    to confirm the sensor is ticking again.
+    """
+    located, error = _resolve_instigator(
+        sensor_name,
+        "SENSOR",
+        repository_name=repository_name,
+        location_name=location_name,
+        env=env,
+    )
+    if error is not None:
+        return error
+
+    selector = {
+        "repositoryName": located["repositoryName"],
+        "repositoryLocationName": located["repositoryLocationName"],
+        "sensorName": sensor_name,
+    }
+    query = """
+    mutation StartSensor($selector: SensorSelector!) {
+      startSensor(sensorSelector: $selector) {
+        __typename
+        ... on Sensor { name sensorState { id status selectorId } }
+        ... on Error { message }
+      }
+    }
+    """
+    result = gql(query, {"selector": selector}, env=env).get("startSensor", {})
+    typename = result.get("__typename")
+    if typename == "Sensor":
+        state = result.get("sensorState") or {}
+        return {
+            "name": sensor_name,
+            "instigator_type": "SENSOR",
+            "repository": located["repositoryName"],
+            "location": located["repositoryLocationName"],
+            "status": state.get("status"),
+            "message": f"Sensor '{sensor_name}' started.",
+        }
+    return {
+        "name": sensor_name,
+        "instigator_type": "SENSOR",
+        "repository": located["repositoryName"],
+        "location": located["repositoryLocationName"],
+        "message": result.get("message", f"Unknown error ({typename})."),
+    }
+
+
+def stop_sensor(
+    sensor_name: str,
+    repository_name: str | None = None,
+    location_name: str | None = None,
+    env: str | None = None,
+) -> dict:
+    """Stop a Dagster sensor so it stops evaluating and launching runs.
+
+    - sensor_name: sensor name (from list_sensors or get_tick_history)
+    - repository_name / location_name: optional, to disambiguate when the same
+      sensor name exists in several code locations
+    - env: optional environment key; defaults to the configured instance
+
+    Returns {name, instigator_type, repository, location, status} on success
+    (status is the new InstigationStatus, normally STOPPED). On failure returns
+    {name, instigator_type, message} — e.g. sensor not found, ambiguous across
+    code locations (nothing is stopped), or the API token lacks the
+    EDIT_SENSOR permission.
+
+    When to use: to halt a runaway or erroring sensor found via
+    get_tick_history or get_instance_status. This is a persistent
+    instance-level change: the sensor stays stopped across daemon restarts and
+    code reloads until someone calls start_sensor. It does NOT cancel runs the
+    sensor already launched — use terminate_run for those. If the sensor
+    declares a default_status in code, a stop recorded here overrides it.
+    """
+    located, error = _resolve_instigator(
+        sensor_name,
+        "SENSOR",
+        repository_name=repository_name,
+        location_name=location_name,
+        env=env,
+        include_state=True,
+    )
+    if error is not None:
+        return error
+    state = located["state"]
+    if not state.get("id") or not state.get("selectorId"):
+        return {
+            "name": sensor_name,
+            "instigator_type": "SENSOR",
+            "repository": located["repositoryName"],
+            "location": located["repositoryLocationName"],
+            "message": _missing_state_ids_message("sensor", sensor_name),
+        }
+
+    query = """
+    mutation StopSensor($originId: String!, $selectorId: String!) {
+      stopSensor(jobOriginId: $originId, jobSelectorId: $selectorId) {
+        __typename
+        ... on StopSensorMutationResult { instigationState { id name status selectorId } }
+        ... on Error { message }
+      }
+    }
+    """
+    variables = {"originId": state["id"], "selectorId": state["selectorId"]}
+    result = gql(query, variables, env=env).get("stopSensor", {})
+    typename = result.get("__typename")
+    if typename == "StopSensorMutationResult":
+        new_state = result.get("instigationState") or {}
+        return {
+            "name": sensor_name,
+            "instigator_type": "SENSOR",
+            "repository": located["repositoryName"],
+            "location": located["repositoryLocationName"],
+            "status": new_state.get("status"),
+            "message": f"Sensor '{sensor_name}' stopped.",
+        }
+    return {
+        "name": sensor_name,
+        "instigator_type": "SENSOR",
+        "repository": located["repositoryName"],
+        "location": located["repositoryLocationName"],
+        "message": result.get("message", f"Unknown error ({typename})."),
     }
 
 
@@ -2271,6 +2683,10 @@ if not READ_ONLY:
     mcp.tool()(materialize_assets)
     mcp.tool()(launch_job_with_partitions)
     mcp.tool()(backfill_assets)
+    mcp.tool()(start_schedule)
+    mcp.tool()(stop_schedule)
+    mcp.tool()(start_sensor)
+    mcp.tool()(stop_sensor)
 
 
 def main():

@@ -29,11 +29,17 @@ Agent: Diagnosing the most recent failure...
 
 Agent: Re-launching the failed job...
        launch_job("etl_pipeline", "my_project") -> run_id: "run_def456", status: STARTED
+
+Agent: One sensor keeps firing on bad data. Checking its ticks...
+       get_tick_history("orders_sensor", "SENSOR") -> 12 consecutive FAILURE ticks
+
+Agent: Stopping it until the upstream fix lands...
+       stop_sensor("orders_sensor") -> status: STOPPED
 ```
 
 ## What it does
 
-23 tools across 6 categories, designed for autonomous DataOps workflows:
+27 tools across 6 categories, designed for autonomous DataOps workflows:
 
 | Category | Tools | What an agent can do |
 |----------|-------|---------------------|
@@ -42,7 +48,7 @@ Agent: Re-launching the failed job...
 | **Jobs** | `list_jobs` | Inventory all jobs across code locations |
 | **Schedules & Sensors** | `list_schedules` `list_sensors` `get_tick_history` | Detect silent failures, missed ticks, sensor errors |
 | **Instance** | `get_instance_status` `list_code_locations` `list_backfills` | Global health check, daemon status, code location errors |
-| **Actions** | `materialize_assets` `backfill_assets` `launch_job` `launch_job_with_partitions` `terminate_run` `reload_code_location` | Materialize concrete assets with config, backfill partitions, launch jobs, stop stuck runs, reload after deploy |
+| **Actions** | `materialize_assets` `backfill_assets` `launch_job` `launch_job_with_partitions` `terminate_run` `start_schedule` `stop_schedule` `start_sensor` `stop_sensor` `reload_code_location` | Materialize concrete assets with config, backfill partitions, launch jobs, stop stuck runs, start or stop schedules and sensors, reload after deploy |
 
 > Actions are opt-in: set `DAGSTER_READ_ONLY=false` to enable write operations.
 
@@ -87,7 +93,7 @@ uv sync
 | `DAGSTER_URL` | Base URL of your Dagster instance | `http://localhost:3000` |
 | `DAGSTER_API_TOKEN` | Dagster Cloud API token (leave empty for self-hosted) | _(empty)_ |
 | `DAGSTER_EXTRA_HEADERS` | JSON object of additional request headers sent to Dagster GraphQL | _(empty)_ |
-| `DAGSTER_READ_ONLY` | When `true`, only read tools are exposed (no launch/terminate/reload) | `true` |
+| `DAGSTER_READ_ONLY` | When `true`, only read tools are exposed (no launch/terminate/reload, no schedule or sensor start/stop) | `true` |
 
 **Self-hosted:**
 
@@ -289,7 +295,7 @@ require Dagster 1.9+.
 | `list_jobs` | List all jobs across all code locations (use to find names for `launch_job`) |
 | `list_schedules` | List schedules with status (RUNNING/STOPPED), cron, target job, next tick |
 | `list_sensors` | List sensors with status and target jobs |
-| `get_tick_history` | Tick-by-tick history for a schedule or sensor — **essential for detecting silent failures** |
+| `get_tick_history` | Tick-by-tick history for a schedule or sensor — **essential for detecting silent failures**. Accepts optional `repository_name` / `location_name` to disambiguate a name shared by several code locations |
 
 ### Instance & Code Locations
 
@@ -307,6 +313,12 @@ require Dagster 1.9+.
 | `backfill_assets` | Launch a partition backfill by **asset selection** with optional run config; respects each asset's `BackfillPolicy` server-side |
 | `launch_job` | Launch a named job; `asset_keys` remains supported for compatibility and is sent through GraphQL `assetSelection`, but the two-step asset workflow is preferred |
 | `launch_job_with_partitions` | Launch a partitioned job for one or more partition keys; creates a backfill (supports `from_failure` to retry only failed steps) |
+| `start_schedule` | Start (enable) a schedule so it launches runs on its cron |
+| `stop_schedule` | Stop (disable) a schedule — persists across restarts; does not terminate in-flight runs |
+| `start_sensor` | Start (enable) a sensor so it resumes evaluating |
+| `stop_sensor` | Stop (disable) a sensor — the fix for a runaway or erroring sensor found via `get_tick_history` |
+
+> Schedule/sensor names are unique only within a repository. If the same name exists in several code locations, the start/stop tools refuse to act and list the candidates; pass `repository_name` / `location_name` to disambiguate. Successful calls echo the resolved `repository` and `location`.
 | `terminate_run` | Stop a stuck or runaway run |
 | `reload_code_location` | Reload a code location after deploy |
 
@@ -330,7 +342,14 @@ verify the required GraphQL capabilities before querying or launching. The
 `RunsFilter` field name (`jobName` vs `pipelineName`) is auto-detected via schema
 introspection. Configured asset backfills also feature-detect
 `LaunchBackfillParams.runConfigData` and return a clear compatibility error when
-an older schema does not expose it.
+an older schema does not expose it. Schedule and sensor start/stop work on
+Dagster 1.6+: the stop mutations are sent with the `originId`/`selectorId`
+argument pair sourced from `InstigationState.id`/`selectorId`, which modern
+Dagster re-parses as a compound id and older versions accept directly, so no
+version branch is needed. The mutations select error messages via the
+`... on Error` interface fragment rather than per-type fragments, because
+`ScheduleNotFoundError` only joined `ScheduleMutationResult` in Dagster 1.9 and
+spreading it on 1.6-1.8 would fail document validation.
 
 ## Development
 

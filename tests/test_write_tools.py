@@ -10,10 +10,15 @@ import pytest
 from dagster_mcp import server as server_module
 from dagster_mcp.server import (
     backfill_assets,
+    get_tick_history,
     launch_job,
     launch_job_with_partitions,
     materialize_assets,
     reload_code_location,
+    start_schedule,
+    start_sensor,
+    stop_schedule,
+    stop_sensor,
     terminate_run,
 )
 
@@ -765,6 +770,514 @@ class TestBackfillAssets:
         ]
 
 
+def _locate_payload(name, field, sid="orig::sel", selector_id="sel", status="RUNNING"):
+    """Canned repositoriesOrError response for the instigator locate query."""
+    state = (
+        {"id": sid, "selectorId": selector_id, "status": status}
+        if sid is not None or selector_id is not None
+        else None
+    )
+    return {"nodes": [{
+        "name": "repo",
+        "location": {"name": "loc"},
+        "schedules": (
+            [{"name": name, "scheduleState": state}] if field == "schedules" else []
+        ),
+        "sensors": (
+            [{"name": name, "sensorState": state}] if field == "sensors" else []
+        ),
+    }]}
+
+
+def _empty_locate():
+    return {"nodes": [{
+        "name": "repo", "location": {"name": "loc"},
+        "schedules": [], "sensors": [],
+    }]}
+
+
+class TestStartSchedule:
+    def test_success(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules"),
+            "startSchedule": {
+                "__typename": "ScheduleStateResult",
+                "scheduleState": {"id": "orig::sel", "name": "daily",
+                                  "status": "RUNNING", "selectorId": "sel"},
+            },
+        }})
+        result = start_schedule("daily")
+        assert result["status"] == "RUNNING"
+        assert result["instigator_type"] == "SCHEDULE"
+
+    def test_sends_schedule_selector(self, mock_gql):
+        mock_post = mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules"),
+            "startSchedule": {"__typename": "ScheduleStateResult",
+                              "scheduleState": {"status": "RUNNING"}},
+        }})
+        start_schedule("daily")
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"]["selector"] == {
+            "repositoryName": "repo",
+            "repositoryLocationName": "loc",
+            "scheduleName": "daily",
+        }
+
+    def test_not_found(self, mock_gql):
+        mock_gql({"data": {"repositoriesOrError": _empty_locate()}})
+        result = start_schedule("daily")
+        assert "not found" in result["message"]
+        assert "status" not in result
+
+    def test_unauthorized(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules"),
+            "startSchedule": {"__typename": "UnauthorizedError", "message": "no perms"},
+        }})
+        result = start_schedule("daily")
+        assert result["message"] == "no perms"
+        assert "status" not in result
+
+    def test_schedule_not_found_error_union(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules"),
+            "startSchedule": {"__typename": "ScheduleNotFoundError", "message": "gone"},
+        }})
+        assert start_schedule("daily")["message"] == "gone"
+
+    def test_python_error(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules"),
+            "startSchedule": {"__typename": "PythonError", "message": "boom"},
+        }})
+        assert start_schedule("daily")["message"] == "boom"
+
+    def test_already_running_is_not_an_error(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules", status="RUNNING"),
+            "startSchedule": {"__typename": "ScheduleStateResult",
+                              "scheduleState": {"status": "RUNNING"}},
+        }})
+        assert start_schedule("daily")["status"] == "RUNNING"
+
+
+class TestStopSchedule:
+    def test_success(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules"),
+            "stopRunningSchedule": {"__typename": "ScheduleStateResult",
+                                    "scheduleState": {"status": "STOPPED"}},
+        }})
+        assert stop_schedule("daily")["status"] == "STOPPED"
+
+    def test_sends_origin_and_selector_ids(self, mock_gql):
+        mock_post = mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules"),
+            "stopRunningSchedule": {"__typename": "ScheduleStateResult",
+                                    "scheduleState": {"status": "STOPPED"}},
+        }})
+        stop_schedule("daily")
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"] == {"originId": "orig::sel", "selectorId": "sel"}
+        # note: "scheduleSelectorId" legitimately contains "scheduleSelector",
+        # so assert on the argument form "scheduleSelector:" instead.
+        assert "scheduleSelector:" not in payload["query"]
+        assert "stopRunningSchedule(id:" not in payload["query"]
+
+    def test_not_found_does_not_mutate(self, monkeypatch):
+        mock_post = MagicMock(side_effect=[
+            _mock_response({"data": {"repositoriesOrError": _empty_locate()}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        result = stop_schedule("daily")
+        assert mock_post.call_count == 1
+        assert "not found" in result["message"]
+
+    def test_missing_state_ids_does_not_mutate(self, monkeypatch):
+        payload = _locate_payload("daily", "schedules", sid=None, selector_id=None)
+        mock_post = MagicMock(side_effect=[
+            _mock_response({"data": {"repositoriesOrError": payload}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        result = stop_schedule("daily")
+        assert mock_post.call_count == 1
+        assert "InstigationState.id" in result["message"]
+
+    def test_unauthorized(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules"),
+            "stopRunningSchedule": {"__typename": "UnauthorizedError", "message": "no perms"},
+        }})
+        result = stop_schedule("daily")
+        assert result["message"] == "no perms"
+        assert "status" not in result
+
+    def test_python_error(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules"),
+            "stopRunningSchedule": {"__typename": "PythonError", "message": "boom"},
+        }})
+        assert stop_schedule("daily")["message"] == "boom"
+
+
+class TestStartSensor:
+    def test_success(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors"),
+            "startSensor": {"__typename": "Sensor", "name": "s",
+                            "sensorState": {"status": "RUNNING"}},
+        }})
+        result = start_sensor("s")
+        assert result["status"] == "RUNNING"
+        assert result["instigator_type"] == "SENSOR"
+
+    def test_sends_sensor_selector(self, mock_gql):
+        mock_post = mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors"),
+            "startSensor": {"__typename": "Sensor", "name": "s",
+                            "sensorState": {"status": "RUNNING"}},
+        }})
+        start_sensor("s")
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"]["selector"] == {
+            "repositoryName": "repo",
+            "repositoryLocationName": "loc",
+            "sensorName": "s",
+        }
+
+    def test_not_found(self, mock_gql):
+        mock_gql({"data": {"repositoriesOrError": _empty_locate()}})
+        result = start_sensor("s")
+        assert "not found" in result["message"]
+        assert "status" not in result
+
+    def test_sensor_not_found_error_union(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors"),
+            "startSensor": {"__typename": "SensorNotFoundError", "message": "gone"},
+        }})
+        assert start_sensor("s")["message"] == "gone"
+
+    def test_unauthorized(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors"),
+            "startSensor": {"__typename": "UnauthorizedError", "message": "no perms"},
+        }})
+        assert start_sensor("s")["message"] == "no perms"
+
+    def test_python_error(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors"),
+            "startSensor": {"__typename": "PythonError", "message": "boom"},
+        }})
+        assert start_sensor("s")["message"] == "boom"
+
+
+class TestStopSensor:
+    def test_success(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors"),
+            "stopSensor": {"__typename": "StopSensorMutationResult",
+                           "instigationState": {"status": "STOPPED"}},
+        }})
+        assert stop_sensor("s")["status"] == "STOPPED"
+
+    def test_null_instigation_state(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors"),
+            "stopSensor": {"__typename": "StopSensorMutationResult",
+                           "instigationState": None},
+        }})
+        result = stop_sensor("s")
+        assert result["status"] is None
+        assert "stopped" in result["message"]
+
+    def test_sends_job_origin_and_selector_ids(self, mock_gql):
+        mock_post = mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors"),
+            "stopSensor": {"__typename": "StopSensorMutationResult",
+                           "instigationState": {"status": "STOPPED"}},
+        }})
+        stop_sensor("s")
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["variables"] == {"originId": "orig::sel", "selectorId": "sel"}
+        assert "jobOriginId" in payload["query"]
+        assert "sensorOriginId" not in payload["query"]
+        assert "stopSensor(id:" not in payload["query"]
+
+    def test_not_found_does_not_mutate(self, monkeypatch):
+        mock_post = MagicMock(side_effect=[
+            _mock_response({"data": {"repositoriesOrError": _empty_locate()}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        result = stop_sensor("s")
+        assert mock_post.call_count == 1
+        assert "not found" in result["message"]
+
+    def test_missing_state_ids_does_not_mutate(self, monkeypatch):
+        payload = _locate_payload("s", "sensors", sid=None, selector_id=None)
+        mock_post = MagicMock(side_effect=[
+            _mock_response({"data": {"repositoriesOrError": payload}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        result = stop_sensor("s")
+        assert mock_post.call_count == 1
+        assert "InstigationState.id" in result["message"]
+
+    def test_unauthorized(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors"),
+            "stopSensor": {"__typename": "UnauthorizedError", "message": "no perms"},
+        }})
+        result = stop_sensor("s")
+        assert result["message"] == "no perms"
+        assert "status" not in result
+
+    def test_python_error(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors"),
+            "stopSensor": {"__typename": "PythonError", "message": "boom"},
+        }})
+        assert stop_sensor("s")["message"] == "boom"
+
+
+def _multi_locate(name, field):
+    """Two code locations exposing the same instigator name."""
+    def node(repo, loc):
+        state = {"id": f"{repo}::sel", "selectorId": f"sel-{repo}", "status": "RUNNING"}
+        return {
+            "name": repo,
+            "location": {"name": loc},
+            "schedules": (
+                [{"name": name, "scheduleState": state}] if field == "schedules" else []
+            ),
+            "sensors": (
+                [{"name": name, "sensorState": state}] if field == "sensors" else []
+            ),
+        }
+
+    return {"nodes": [node("repo_a", "loc_a"), node("repo_b", "loc_b")]}
+
+
+class TestInstigatorDisambiguation:
+    @pytest.mark.parametrize(
+        "fn,name,field",
+        [
+            (start_schedule, "daily", "schedules"),
+            (stop_schedule, "daily", "schedules"),
+            (start_sensor, "s", "sensors"),
+            (stop_sensor, "s", "sensors"),
+        ],
+    )
+    def test_ambiguous_name_refuses_and_does_not_mutate(
+        self, fn, name, field, monkeypatch
+    ):
+        mock_post = MagicMock(side_effect=[
+            _mock_response({"data": {"repositoriesOrError": _multi_locate(name, field)}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        result = fn(name)
+        assert mock_post.call_count == 1  # locate only, no mutation
+        assert "Ambiguous" in result["message"]
+        assert "loc_a/repo_a" in result["message"]
+        assert "loc_b/repo_b" in result["message"]
+        assert result["candidates"] == [
+            {"repository": "repo_a", "location": "loc_a"},
+            {"repository": "repo_b", "location": "loc_b"},
+        ]
+        assert "status" not in result
+
+    def test_repository_filter_selects_the_right_one(self, mock_gql):
+        mock_post = mock_gql({"data": {
+            "repositoriesOrError": _multi_locate("s", "sensors"),
+            "stopSensor": {"__typename": "StopSensorMutationResult",
+                           "instigationState": {"status": "STOPPED"}},
+        }})
+        result = stop_sensor("s", repository_name="repo_b", location_name="loc_b")
+        assert result["status"] == "STOPPED"
+        assert result["repository"] == "repo_b"
+        assert result["location"] == "loc_b"
+        assert mock_post.call_args.kwargs["json"]["variables"] == {
+            "originId": "repo_b::sel",
+            "selectorId": "sel-repo_b",
+        }
+
+    def test_location_filter_used_for_start_schedule(self, mock_gql):
+        mock_post = mock_gql({"data": {
+            "repositoriesOrError": _multi_locate("daily", "schedules"),
+            "startSchedule": {"__typename": "ScheduleStateResult",
+                              "scheduleState": {"status": "RUNNING"}},
+        }})
+        result = start_schedule("daily", location_name="loc_b")
+        assert result["status"] == "RUNNING"
+        assert mock_post.call_args.kwargs["json"]["variables"]["selector"] == {
+            "repositoryName": "repo_b",
+            "repositoryLocationName": "loc_b",
+            "scheduleName": "daily",
+        }
+
+    def test_filter_that_matches_nothing_is_not_found(self, mock_gql):
+        mock_gql({"data": {"repositoriesOrError": _multi_locate("s", "sensors")}})
+        result = start_sensor("s", repository_name="nope")
+        assert "not found" in result["message"]
+
+    @pytest.mark.parametrize(
+        "fn,name,field",
+        [
+            (start_schedule, "daily", "schedules"),
+            (stop_schedule, "daily", "schedules"),
+            (start_sensor, "s", "sensors"),
+            (stop_sensor, "s", "sensors"),
+        ],
+    )
+    def test_success_echoes_resolved_repository_and_location(
+        self, fn, name, field, mock_gql
+    ):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload(name, field),
+            "startSchedule": {"__typename": "ScheduleStateResult",
+                              "scheduleState": {"status": "RUNNING"}},
+            "stopRunningSchedule": {"__typename": "ScheduleStateResult",
+                                    "scheduleState": {"status": "STOPPED"}},
+            "startSensor": {"__typename": "Sensor", "name": name,
+                            "sensorState": {"status": "RUNNING"}},
+            "stopSensor": {"__typename": "StopSensorMutationResult",
+                           "instigationState": {"status": "STOPPED"}},
+        }})
+        result = fn(name)
+        assert result["repository"] == "repo"
+        assert result["location"] == "loc"
+
+
+class TestMutationSchemaCompatibility:
+    """Guards against fragments that do not validate on older Dagster schemas."""
+
+    @pytest.mark.parametrize(
+        "fn,name,field,mutation,success",
+        [
+            (start_schedule, "daily", "schedules", "startSchedule",
+             {"__typename": "ScheduleStateResult",
+              "scheduleState": {"status": "RUNNING"}}),
+            (stop_schedule, "daily", "schedules", "stopRunningSchedule",
+             {"__typename": "ScheduleStateResult",
+              "scheduleState": {"status": "STOPPED"}}),
+            (start_sensor, "s", "sensors", "startSensor",
+             {"__typename": "Sensor", "name": "s",
+              "sensorState": {"status": "RUNNING"}}),
+            (stop_sensor, "s", "sensors", "stopSensor",
+             {"__typename": "StopSensorMutationResult",
+              "instigationState": {"status": "STOPPED"}}),
+        ],
+    )
+    def test_error_members_use_interface_fragment(
+        self, fn, name, field, mutation, success, mock_gql
+    ):
+        # ScheduleNotFoundError joined ScheduleMutationResult only in Dagster
+        # 1.9; spreading it on 1.6-1.8 is a document validation error. Same
+        # reasoning applies to the other error members, so all four mutations
+        # use `... on Error { message }` instead of per-type fragments.
+        mock_post = mock_gql({"data": {
+            "repositoriesOrError": _locate_payload(name, field),
+            mutation: success,
+        }})
+        fn(name)
+        query = mock_post.call_args.kwargs["json"]["query"]
+        assert "... on Error { message }" in query
+        assert "ScheduleNotFoundError" not in query
+        assert "SensorNotFoundError" not in query
+        assert "UnauthorizedError" not in query
+        assert "PythonError" not in query
+
+
+class TestLocateQueryWeight:
+    """Instigation state is resolved per instigator, so only ask when needed."""
+
+    @pytest.mark.parametrize(
+        "fn,name,field,mutation,success",
+        [
+            (start_schedule, "daily", "schedules", "startSchedule",
+             {"__typename": "ScheduleStateResult",
+              "scheduleState": {"status": "RUNNING"}}),
+            (start_sensor, "s", "sensors", "startSensor",
+             {"__typename": "Sensor", "name": "s",
+              "sensorState": {"status": "RUNNING"}}),
+        ],
+    )
+    def test_start_tools_do_not_resolve_instigation_state(
+        self, fn, name, field, mutation, success, monkeypatch
+    ):
+        mock_post = MagicMock(side_effect=[
+            _mock_response({"data": {"repositoriesOrError": _locate_payload(name, field)}}),
+            _mock_response({"data": {mutation: success}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        fn(name)
+        locate_query = mock_post.call_args_list[0].kwargs["json"]["query"]
+        assert "scheduleState" not in locate_query
+        assert "sensorState" not in locate_query
+
+    def test_get_tick_history_does_not_resolve_instigation_state(self, monkeypatch):
+        mock_post = MagicMock(side_effect=[
+            _mock_response({"data": {
+                "repositoriesOrError": _locate_payload("daily", "schedules"),
+            }}),
+            _mock_response({"data": {"instigationStateOrError": {
+                "__typename": "InstigationState", "ticks": [],
+            }}}),
+        ])
+        monkeypatch.setattr(httpx, "post", mock_post)
+        get_tick_history("daily", "SCHEDULE")
+        locate_query = mock_post.call_args_list[0].kwargs["json"]["query"]
+        assert "scheduleState" not in locate_query
+        assert "sensorState" not in locate_query
+
+    @pytest.mark.parametrize(
+        "fn,name,field,state_key",
+        [
+            (stop_schedule, "daily", "schedules", "scheduleState"),
+            (stop_sensor, "s", "sensors", "sensorState"),
+        ],
+    )
+    def test_stop_tools_do_resolve_instigation_state(
+        self, fn, name, field, state_key, mock_gql
+    ):
+        mock_post = mock_gql({"data": {
+            "repositoriesOrError": _locate_payload(name, field),
+            "stopRunningSchedule": {"__typename": "ScheduleStateResult",
+                                    "scheduleState": {"status": "STOPPED"}},
+            "stopSensor": {"__typename": "StopSensorMutationResult",
+                           "instigationState": {"status": "STOPPED"}},
+        }})
+        fn(name)
+        locate_query = mock_post.call_args_list[0].kwargs["json"]["query"]
+        assert f"{state_key} {{ id selectorId }}" in locate_query
+
+
+class TestStopWhenAlreadyStopped:
+    """Stopping an already-stopped instigator is reported, not treated as failure."""
+
+    def test_schedule_already_stopped(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules", status="STOPPED"),
+            "stopRunningSchedule": {"__typename": "ScheduleStateResult",
+                                    "scheduleState": {"status": "STOPPED"}},
+        }})
+        result = stop_schedule("daily")
+        assert result["status"] == "STOPPED"
+        assert "stopped" in result["message"]
+
+    def test_sensor_already_stopped(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("s", "sensors", status="STOPPED"),
+            "stopSensor": {"__typename": "StopSensorMutationResult",
+                           "instigationState": {"status": "STOPPED"}},
+        }})
+        result = stop_sensor("s")
+        assert result["status"] == "STOPPED"
+        assert "stopped" in result["message"]
+
+
 class TestReadOnlyGating:
     def test_write_tools_not_registered_in_readonly(self):
         import asyncio
@@ -779,6 +1292,10 @@ class TestReadOnlyGating:
             assert "terminate_run" not in tool_names
             assert "launch_job" not in tool_names
             assert "launch_job_with_partitions" not in tool_names
+            assert "start_schedule" not in tool_names
+            assert "stop_schedule" not in tool_names
+            assert "start_sensor" not in tool_names
+            assert "stop_sensor" not in tool_names
 
     def test_materializer_registered_in_readwrite_mode(self):
         script = """
@@ -801,3 +1318,7 @@ print("\\n".join(sorted(tool.name for tool in asyncio.run(mcp.list_tools()))))
         tool_names = set(result.stdout.splitlines())
         assert "resolve_asset_selection" in tool_names
         assert "materialize_assets" in tool_names
+        assert "start_schedule" in tool_names
+        assert "stop_schedule" in tool_names
+        assert "start_sensor" in tool_names
+        assert "stop_sensor" in tool_names
