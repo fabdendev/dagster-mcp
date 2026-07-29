@@ -10,6 +10,8 @@ An [MCP](https://modelcontextprotocol.io/) server that gives AI agents full visi
 
 Works with any MCP client: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Claude Desktop](https://claude.ai), [Cursor](https://cursor.sh), and more.
 
+Dagster officially develops and supports their own Dagster Plus MCP server. See the documentation [here](https://docs.dagster.io/guides/labs/dagster-mcp).
+
 ## Why this exists
 
 Data pipelines break at 3 AM. Schedules silently stop firing. Assets go stale. Instead of waking up to a dashboard full of red, give your AI agent the tools to **monitor, diagnose, and fix** your Dagster instance autonomously.
@@ -326,11 +328,11 @@ require Dagster 1.9+.
 
 ## How it differs from the official Dagster MCP
 
-| | **dagster-mcp** (this project) | **dg[mcp]** ([official](https://dagster.io/blog/dagsters-mcp-server)) |
+| | **dagster-mcp** (this project) | **Dagster+ MCP** [official](https://docs.dagster.io/guides/labs/dagster-mcp) | **dagster-expert** skill ([official](https://docs.dagster.io/getting-started/ai-tools)) |
 |---|---|---|
-| **Purpose** | Monitor and operate a **running** instance | Write Dagster **code** and scaffold components |
-| **When** | Operations time | Development time |
-| **What it does** | Inspect runs, read logs, check assets, launch jobs | Generate definitions, use `dg` CLI, build pipelines |
+| **Purpose** | Monitor and operate a **running** instance |  Monitor and operate a **running** Dagster+ instance | Write Dagster **code** and scaffold components |
+| **When** | Operations time | Operations time | Development time |
+| **What it does** | Inspect runs, read logs, check assets, launch jobs | Inspect runs, read logs, check assets, launch jobs, inspect alerts | Generate definitions, use `dg` CLI, build pipelines |
 
 They serve different purposes and work well together.
 
@@ -363,3 +365,4 @@ uv run python -m dagster_mcp      # start server locally
 ## License
 
 MIT
+
