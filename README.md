@@ -10,6 +10,8 @@ An [MCP](https://modelcontextprotocol.io/) server that gives AI agents full visi
 
 Works with any MCP client: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Claude Desktop](https://claude.ai), [Cursor](https://cursor.sh), and more.
 
+Dagster officially develops and supports their own Dagster Plus MCP server. See the documentation [here](https://docs.dagster.io/guides/labs/dagster-mcp).
+
 ## Why this exists
 
 Data pipelines break at 3 AM. Schedules silently stop firing. Assets go stale. Instead of waking up to a dashboard full of red, give your AI agent the tools to **monitor, diagnose, and fix** your Dagster instance autonomously.
@@ -324,15 +326,35 @@ require Dagster 1.9+.
 
 > Write tools require `DAGSTER_READ_ONLY=false` (default is `true`).
 
-## How it differs from the official Dagster MCP
+## How it differs from Dagster's official AI tooling
 
-| | **dagster-mcp** (this project) | **dg[mcp]** ([official](https://dagster.io/blog/dagsters-mcp-server)) |
-|---|---|---|
-| **Purpose** | Monitor and operate a **running** instance | Write Dagster **code** and scaffold components |
-| **When** | Operations time | Development time |
-| **What it does** | Inspect runs, read logs, check assets, launch jobs | Generate definitions, use `dg` CLI, build pipelines |
+Dagster builds and supports its own AI tooling. If you are a **Dagster+ customer**, start with theirs — it is first-party, needs no local runtime, and reaches Dagster+ platform objects (alerting, Issues, Insights) that this project cannot. This project exists mainly for people running **open-source / self-hosted Dagster**, which the official server's documented setup does not cover.
 
-They serve different purposes and work well together.
+Everything in the "official" column comes from Dagster's own docs at <https://docs.dagster.io/guides/labs/dagster-mcp> (retrieved 2026-07-30), or from Dagster directly in [#21](https://github.com/fabdendev/dagster-mcp/pull/21). Dagster's docs nowhere state that open-source or self-hosted Dagster is unsupported; what they document is a Dagster-hosted URL, a required `Dagster-Cloud-Organization` header, and a Dagster+ user token. Their capability matrix is a snapshot of today and Dagster expects to keep adding to it, so treat the gaps below as current rather than permanent.
+
+| | **dagster-mcp** (this project) | **[Dagster+ MCP server](https://docs.dagster.io/guides/labs/dagster-mcp)** (official) | **[`dagster-expert` skill](https://docs.dagster.io/getting-started/ai-tools)** (official) |
+|---|---|---|---|
+| **What it is** | MCP server you run yourself (Python, MIT) | Dagster-hosted remote MCP endpoint at `https://mcp.agent.dagster.cloud/mcp` | An Agent Skill — markdown instructions loaded by your coding agent, not an MCP server |
+| **When you use it** | Operations time, against a live instance | Operations time, against a Dagster+ deployment | Development time, against your local codebase |
+| **Works with self-hosted / OSS Dagster** | Yes — points at any Dagster webserver (`DAGSTER_URL`, default `http://localhost:3000`; `/graphql` is appended). No token required | Not per the documented setup: the only URL given is Dagster-hosted, and connecting requires a `Dagster-Cloud-Organization` header plus a Dagster+ user token | Yes — Apache-2.0 markdown files you copy locally |
+| **Works with Dagster+** | Yes — sends a `Dagster-Cloud-Api-Token` header; extra headers via `DAGSTER_EXTRA_HEADERS` | Yes — this is its only documented target | n/a |
+| **Setup** | Local process launched by your MCP client (Python 3.12+, e.g. `uvx dagster-mcp`), configured with env vars | No local runtime: `claude mcp add --transport http dagster-plus https://mcp.agent.dagster.cloud/mcp --header "Dagster-Cloud-Organization: …" --header "Authorization: Bearer …"` | Copy the skill files into your agent |
+| **Maturity** | v0.8.0 on PyPI (pre-1.0), MIT, single maintainer with occasional outside contributions, "AS IS, WITHOUT WARRANTY OF ANY KIND", no SLA | Labelled by Dagster as Preview: *"under active development, and not considered ready for production use… the APIs may change"*, and published under `/guides/labs/` | Current, no preview label |
+| **Runs** | View, launch, terminate, per-step stats, log retrieval, consolidated failure summary | View ✅, Create/Launch ✅, Delete/Terminate ✅, Insights metrics ✅, Update ❌ (Dagster's matrix); run logs View ✅ | n/a |
+| **Assets** | View, search, health, resolve selection syntax, and **materialize specific assets** (`resolve_asset_selection` → `materialize_assets`, with run config and partition ranges) | View ✅ and Insights metrics ✅; Create/Launch, Update and Delete marked ❌ — i.e. no asset-level materialization tool, though launching a run is supported | n/a |
+| **Schedules & sensors** | List, tick history, start/stop | Not supported today — confirmed by Dagster, who expect to add it | n/a |
+| **Backfills & partitions** | List backfills, launch partitioned jobs, backfill assets over a partition range | Not listed in Dagster's capability matrix | n/a |
+| **Code locations & instance health** | List/reload code locations, instance status, daemon heartbeats, queued-run counts | Deployments View ✅ and Insights ✅; code locations and daemon health not listed (Dagster+ manages the daemon) | n/a |
+| **Alerting, Insights, Dagster+ Issues** | Not supported — no alerting, cost/Insights metrics, or Issues equivalent | Alert policies and Dagster+ Issues: View / Create / Update / Delete all ✅. Insights metrics ✅ on Runs, Assets and Deployments. All three are documented Dagster+ features (Issues is in limited early access) | n/a |
+| **Multiple instances** | Yes — `DAGSTER_ENVS` maps names to arbitrary URLs and tokens, with a per-tool `env` argument; you can mix OSS and Dagster+ | Deployments within one Dagster+ organization, selected per tool call | n/a |
+| **Write safety** | 17 read tools always registered; the 10 write tools are registered only when `DAGSTER_READ_ONLY=false` (default `true`), so clients cannot even see them otherwise. This is a convenience guardrail, **not** a security boundary: it is a process-level env var read at import, and the API token you configure keeps whatever rights it has | Enforced server-side by Dagster+ token permissions. The docs default to a personal user token; a [service user](https://docs.dagster.io/deployment/dagster-plus/authentication-and-access-control/rbac/users#service-users) is offered as the alternative for scoped, non-human auth (service users are a Dagster+ Pro feature) | n/a |
+| **Support** | Best-effort, community, GitHub issues; no SECURITY.md or documented disclosure process | First-party vendor | First-party vendor |
+
+**Use the official Dagster+ MCP server if** you are on Dagster+ and want alerting, Issues or Insights/cost analysis from an agent, want no local runtime, or need vendor support and a supplier your procurement process will accept.
+
+**Use this project if** you run open-source or self-hosted Dagster, or you need asset-level materialization, schedule/sensor control, backfills, or code-location and daemon operations from an agent.
+
+For Dagster+ users the two are complementary rather than competing — nothing stops you running both. This project is not affiliated with or endorsed by Dagster Labs.
 
 ## Compatibility
 
@@ -363,3 +385,4 @@ uv run python -m dagster_mcp      # start server locally
 ## License
 
 MIT
+
