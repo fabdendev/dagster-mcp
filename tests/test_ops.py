@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Callable
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 from unittest.mock import MagicMock
 
 import pytest
@@ -11,7 +11,7 @@ from dagster_mcp.server import get_tick_history, list_jobs, list_schedules, list
 
 class _JobPayload(TypedDict):
     name: str
-    description: str | None
+    description: NotRequired[str | None]
 
 
 class _LocationPayload(TypedDict):
@@ -85,10 +85,14 @@ class TestListJobs:
         )
         monkeypatch.setattr(server, "gql", mock)
 
-        result = list_jobs(repository_name="example_repo")
+        result = list_jobs(env="staging", repository_name="example_repo")
 
         assert [job["job"] for job in result] == ["north_job", "south_job"]
         assert mock.call_count == 2
+        assert [call.kwargs["env"] for call in mock.call_args_list] == [
+            "staging",
+            "staging",
+        ]
         assert "jobs {" not in mock.call_args_list[0].args[0]
         query, variables = mock.call_args_list[1].args
         assert "repository0: repositoriesOrError" in query
@@ -105,7 +109,6 @@ class TestListJobs:
                 "repositoryLocationName": "south",
             },
         }
-        assert "example_repo_archive" not in str(variables)
 
     def test_location_filter_batches_each_exact_match(
         self, monkeypatch: pytest.MonkeyPatch
@@ -145,7 +148,6 @@ class TestListJobs:
                 "repositoryLocationName": "example_location",
             },
         }
-        assert "gamma" not in str(variables)
 
     def test_combined_filters_use_one_server_side_selector(
         self, monkeypatch: pytest.MonkeyPatch
@@ -212,38 +214,18 @@ class TestListJobs:
         assert list_jobs(repository_name="missing_repo") == []
         mock.assert_called_once()
 
-    def test_filters_propagate_environment_to_every_query(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        "job",
+        [
+            pytest.param({"name": "job", "description": None}, id="null"),
+            pytest.param({"name": "job"}, id="missing"),
+        ],
+    )
+    def test_empty_description_is_normalized_to_empty_string(
+        self, mock_gql: _MockGql, job: _JobPayload
     ) -> None:
-        mock = MagicMock(
-            side_effect=[
-                {
-                    "repositoriesOrError": {
-                        "nodes": [self._repository("example_repo", "example_location")]
-                    }
-                },
-                {
-                    "repository0": {
-                        "nodes": [
-                            self._repository(
-                                "example_repo", "example_location", "example_job"
-                            )
-                        ]
-                    }
-                },
-            ]
-        )
-        monkeypatch.setattr(server, "gql", mock)
-
-        list_jobs(env="staging", repository_name="example_repo")
-
-        assert [call.kwargs["env"] for call in mock.call_args_list] == ["staging", "staging"]
-
-    def test_null_description_is_normalized_to_empty_string(
-        self, mock_gql: _MockGql
-    ) -> None:
-        repository = self._repository("repo", "location", "job")
-        repository["jobs"][0]["description"] = None
+        repository = self._repository("repo", "location")
+        repository["jobs"] = [job]
         mock_gql({"data": {"repositoriesOrError": {"nodes": [repository]}}})
 
         assert list_jobs()[0]["description"] == ""

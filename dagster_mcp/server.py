@@ -1233,18 +1233,16 @@ def _jobs_from_repositories(
     repositories: Sequence[Mapping[str, Any]],
 ) -> list[JobInfo]:
     """Flatten repository job metadata into the public list_jobs schema."""
-    result: list[JobInfo] = []
-    for repo in repositories:
-        for job in repo.get("jobs", []):
-            result.append(
-                {
-                    "repository": repo["name"],
-                    "location": repo["location"]["name"],
-                    "job": job["name"],
-                    "description": job.get("description") or "",
-                }
-            )
-    return result
+    return [
+        JobInfo(
+            repository=repo["name"],
+            location=repo["location"]["name"],
+            job=job["name"],
+            description=job.get("description") or "",
+        )
+        for repo in repositories
+        for job in repo.get("jobs", [])
+    ]
 
 
 def _repository_jobs(
