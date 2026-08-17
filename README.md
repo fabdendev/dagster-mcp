@@ -47,7 +47,7 @@ Agent: Stopping it until the upstream fix lands...
 |----------|-------|---------------------|
 | **Runs** | `get_runs` `get_run_status` `get_run_logs` `get_run_stats` `get_run_failure_summary` | Find failures, diagnose root causes, inspect logs and step timing |
 | **Assets** | `search_assets` `resolve_asset_selection` `get_asset_details` `get_recent_materializations` `get_asset_health` | Discover assets, preview lineage selections, check freshness, detect stale data |
-| **Jobs** | `list_jobs` | Inventory all jobs across code locations |
+| **Jobs** | `list_jobs` | Inventory jobs across code locations, with optional repository/location filters |
 | **Schedules & Sensors** | `list_schedules` `list_sensors` `get_tick_history` | Detect silent failures, missed ticks, sensor errors |
 | **Instance** | `get_instance_status` `list_code_locations` `list_backfills` | Global health check, daemon status, code location errors |
 | **Actions** | `materialize_assets` `backfill_assets` `launch_job` `launch_job_with_partitions` `terminate_run` `start_schedule` `stop_schedule` `start_sensor` `stop_sensor` `reload_code_location` | Materialize concrete assets with config, backfill partitions, launch jobs, stop stuck runs, start or stop schedules and sensors, reload after deploy |
@@ -294,10 +294,16 @@ require Dagster 1.9+.
 
 | Tool | Description |
 |------|-------------|
-| `list_jobs` | List all jobs across all code locations (use to find names for `launch_job`) |
+| `list_jobs` | List jobs across code locations, optionally filtered by exact `repository_name` and/or `location_name` (use to find names for `launch_job`) |
 | `list_schedules` | List schedules with status (RUNNING/STOPPED), cron, target job, next tick |
 | `list_sensors` | List sensors with status and target jobs |
 | `get_tick_history` | Tick-by-tick history for a schedule or sensor — **essential for detecting silent failures**. Accepts optional `repository_name` / `location_name` to disambiguate a name shared by several code locations |
+
+`list_jobs` filters are independent and use AND semantics when combined. For
+example, `list_jobs(repository_name="example_repository")` finds that repository
+across locations, while
+`list_jobs(repository_name="example_repository", location_name="example_location")`
+targets one repository and code-location pair.
 
 ### Instance & Code Locations
 
@@ -385,4 +391,3 @@ uv run python -m dagster_mcp      # start server locally
 ## License
 
 MIT
-

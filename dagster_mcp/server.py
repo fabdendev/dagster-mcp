@@ -1169,36 +1169,61 @@ def get_asset_health(asset_key_or_group: str, env: str | None = None) -> list[di
 # ── Jobs & Schedules & Sensors ────────────────────────────────────────────────
 
 
-@mcp.tool()
-def list_jobs(env: str | None = None) -> list[dict]:
-    """List all jobs across all code locations. Use this to discover available jobs.
-
-    Returns per job: repository name, code location name, job name, and description.
-
-    When to use: as a starting point to explore what jobs exist, or to find the
-    exact job name and repository_location needed for launch_job.
-    """
-    query = """
-    query ListJobs {
-      repositoriesOrError {
-        ... on RepositoryConnection {
-          nodes {
-            name
-            location { name }
-            jobs {
-              name
-              description
-            }
-          }
+_LIST_JOBS_QUERY = """
+query ListJobs {
+  repositoriesOrError {
+    ... on RepositoryConnection {
+      nodes {
+        name
+        location { name }
+        jobs {
+          name
+          description
         }
-        ... on PythonError { message }
       }
     }
-    """
-    data = gql(query, env=env)
-    repos = data.get("repositoriesOrError", {}).get("nodes", [])
+    ... on PythonError { message }
+  }
+}
+"""
+
+_LIST_JOB_REPOSITORIES_QUERY = """
+query ListJobRepositories {
+  repositoriesOrError {
+    ... on RepositoryConnection {
+      nodes {
+        name
+        location { name }
+      }
+    }
+    ... on PythonError { message }
+  }
+}
+"""
+
+_LIST_REPOSITORY_JOBS_QUERY = """
+query ListRepositoryJobs($repositorySelector: RepositorySelector!) {
+  repositoriesOrError(repositorySelector: $repositorySelector) {
+    ... on RepositoryConnection {
+      nodes {
+        name
+        location { name }
+        jobs {
+          name
+          description
+        }
+      }
+    }
+    ... on PythonError { message }
+  }
+}
+"""
+
+
+def _jobs_from_repositories(repositories: list[dict]) -> list[dict]:
+    """Flatten repository job metadata into the public list_jobs schema."""
     result = []
-    for repo in repos:
+    for repo in repositories:
         for job in repo.get("jobs", []):
             result.append(
                 {
@@ -1208,6 +1233,60 @@ def list_jobs(env: str | None = None) -> list[dict]:
                     "description": job.get("description", ""),
                 }
             )
+    return result
+
+
+def _repository_jobs(
+    repository_name: str, location_name: str, env: str | None
+) -> list[dict]:
+    selector = {
+        "repositoryName": repository_name,
+        "repositoryLocationName": location_name,
+    }
+    data = gql(
+        _LIST_REPOSITORY_JOBS_QUERY,
+        {"repositorySelector": selector},
+        env=env,
+    )
+    repositories = data.get("repositoriesOrError", {}).get("nodes", [])
+    return _jobs_from_repositories(repositories)
+
+
+@mcp.tool()
+def list_jobs(
+    env: str | None = None,
+    repository_name: str | None = None,
+    location_name: str | None = None,
+) -> list[dict]:
+    """List jobs across code locations, optionally filtered by repository or location.
+
+    Returns per job: repository name, code location name, job name, and description.
+    repository_name and location_name are independent exact-match filters; when
+    both are supplied, a job must match both.
+
+    When to use: as a starting point to explore what jobs exist, or to find the
+    exact job name and repository_location needed for launch_job.
+    """
+    if repository_name is not None and location_name is not None:
+        return _repository_jobs(repository_name, location_name, env)
+
+    if repository_name is None and location_name is None:
+        data = gql(_LIST_JOBS_QUERY, env=env)
+        repositories = data.get("repositoriesOrError", {}).get("nodes", [])
+        return _jobs_from_repositories(repositories)
+
+    data = gql(_LIST_JOB_REPOSITORIES_QUERY, env=env)
+    repositories = data.get("repositoriesOrError", {}).get("nodes", [])
+    matches = [
+        repo
+        for repo in repositories
+        if (repository_name is None or repo["name"] == repository_name)
+        and (location_name is None or repo["location"]["name"] == location_name)
+    ]
+
+    result = []
+    for repo in matches:
+        result.extend(_repository_jobs(repo["name"], repo["location"]["name"], env))
     return result
 
 
