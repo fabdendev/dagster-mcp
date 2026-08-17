@@ -1,14 +1,35 @@
+import asyncio
+from collections.abc import Callable
+from typing import TypedDict
 from unittest.mock import MagicMock
 
 import pytest
 
 from dagster_mcp import server
-from dagster_mcp.server import list_jobs, list_schedules, list_sensors, get_tick_history
+from dagster_mcp.server import get_tick_history, list_jobs, list_schedules, list_sensors
+
+
+class _JobPayload(TypedDict):
+    name: str
+    description: str | None
+
+
+class _LocationPayload(TypedDict):
+    name: str
+
+
+class _RepositoryPayload(TypedDict):
+    name: str
+    location: _LocationPayload
+    jobs: list[_JobPayload]
+
+
+_MockGql = Callable[..., MagicMock]
 
 
 class TestListJobs:
     @staticmethod
-    def _repository(name, location, *jobs):
+    def _repository(name: str, location: str, *jobs: str) -> _RepositoryPayload:
         return {
             "name": name,
             "location": {"name": location},
@@ -18,7 +39,7 @@ class TestListJobs:
             ],
         }
 
-    def test_jobs_across_repos(self, mock_gql):
+    def test_jobs_across_repos(self, mock_gql: _MockGql) -> None:
         mock_gql({"data": {"repositoriesOrError": {"nodes": [
             {"name": "repo1", "location": {"name": "loc1"}, "jobs": [
                 {"name": "job_a", "description": "Job A"},
@@ -35,12 +56,14 @@ class TestListJobs:
             "job": "job_a", "description": "Job A",
         }
 
-    def test_empty(self, mock_gql):
+    def test_empty(self, mock_gql: _MockGql) -> None:
         mock_gql({"data": {"repositoriesOrError": {"nodes": []}}})
         assert list_jobs() == []
 
-    def test_repository_filter_fetches_jobs_for_each_exact_match(self, monkeypatch):
-        repositories = [
+    def test_repository_filter_batches_exact_matches_in_stable_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repositories: list[_RepositoryPayload] = [
             self._repository("example_repo", "north"),
             self._repository("example_repo", "south"),
             self._repository("example_repo_archive", "north"),
@@ -49,13 +72,13 @@ class TestListJobs:
             side_effect=[
                 {"repositoriesOrError": {"nodes": repositories}},
                 {
-                    "repositoriesOrError": {
+                    "repository1": {
+                        "nodes": [
+                            self._repository("example_repo", "south", "south_job")
+                        ]
+                    },
+                    "repository0": {
                         "nodes": [self._repository("example_repo", "north", "north_job")]
-                    }
-                },
-                {
-                    "repositoriesOrError": {
-                        "nodes": [self._repository("example_repo", "south", "south_job")]
                     }
                 },
             ]
@@ -65,16 +88,29 @@ class TestListJobs:
         result = list_jobs(repository_name="example_repo")
 
         assert [job["job"] for job in result] == ["north_job", "south_job"]
-        assert mock.call_count == 3
+        assert mock.call_count == 2
         assert "jobs {" not in mock.call_args_list[0].args[0]
-        selectors = [call.args[1]["repositorySelector"] for call in mock.call_args_list[1:]]
-        assert selectors == [
-            {"repositoryName": "example_repo", "repositoryLocationName": "north"},
-            {"repositoryName": "example_repo", "repositoryLocationName": "south"},
-        ]
+        query, variables = mock.call_args_list[1].args
+        assert "repository0: repositoriesOrError" in query
+        assert "repository1: repositoriesOrError" in query
+        assert "$repositorySelector0: RepositorySelector!" in query
+        assert "$repositorySelector1: RepositorySelector!" in query
+        assert variables == {
+            "repositorySelector0": {
+                "repositoryName": "example_repo",
+                "repositoryLocationName": "north",
+            },
+            "repositorySelector1": {
+                "repositoryName": "example_repo",
+                "repositoryLocationName": "south",
+            },
+        }
+        assert "example_repo_archive" not in str(variables)
 
-    def test_location_filter_fetches_jobs_for_each_exact_match(self, monkeypatch):
-        repositories = [
+    def test_location_filter_batches_each_exact_match(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repositories: list[_RepositoryPayload] = [
             self._repository("alpha", "example_location"),
             self._repository("beta", "example_location"),
             self._repository("gamma", "example_location_archive"),
@@ -83,14 +119,12 @@ class TestListJobs:
             side_effect=[
                 {"repositoriesOrError": {"nodes": repositories}},
                 {
-                    "repositoriesOrError": {
+                    "repository0": {
                         "nodes": [self._repository("alpha", "example_location", "alpha_job")]
-                    }
-                },
-                {
-                    "repositoriesOrError": {
+                    },
+                    "repository1": {
                         "nodes": [self._repository("beta", "example_location", "beta_job")]
-                    }
+                    },
                 },
             ]
         )
@@ -99,12 +133,26 @@ class TestListJobs:
         result = list_jobs(location_name="example_location")
 
         assert [job["job"] for job in result] == ["alpha_job", "beta_job"]
-        assert mock.call_count == 3
+        assert mock.call_count == 2
+        variables = mock.call_args_list[1].args[1]
+        assert variables == {
+            "repositorySelector0": {
+                "repositoryName": "alpha",
+                "repositoryLocationName": "example_location",
+            },
+            "repositorySelector1": {
+                "repositoryName": "beta",
+                "repositoryLocationName": "example_location",
+            },
+        }
+        assert "gamma" not in str(variables)
 
-    def test_combined_filters_use_one_server_side_selector(self, monkeypatch):
+    def test_combined_filters_use_one_server_side_selector(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         mock = MagicMock(
             return_value={
-                "repositoriesOrError": {
+                "repository0": {
                     "nodes": [
                         self._repository("example_repo", "example_location", "selected_job")
                     ]
@@ -120,18 +168,20 @@ class TestListJobs:
 
         assert [job["job"] for job in result] == ["selected_job"]
         query, variables = mock.call_args.args
-        assert "RepositorySelector!" in query
+        assert "repository0: repositoriesOrError" in query
         assert variables == {
-            "repositorySelector": {
+            "repositorySelector0": {
                 "repositoryName": "example_repo",
                 "repositoryLocationName": "example_location",
             }
         }
 
-    def test_combined_filters_with_no_match_return_empty(self, monkeypatch):
+    def test_combined_filters_with_no_match_return_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         mock = MagicMock(
             return_value={
-                "repositoriesOrError": {
+                "repository0": {
                     "__typename": "PythonError",
                     "message": "Repository not found",
                 }
@@ -147,7 +197,9 @@ class TestListJobs:
         assert result == []
         mock.assert_called_once()
 
-    def test_single_filter_with_no_matches_does_not_fetch_jobs(self, monkeypatch):
+    def test_single_filter_with_no_matches_does_not_fetch_jobs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         mock = MagicMock(
             return_value={
                 "repositoriesOrError": {
@@ -160,7 +212,9 @@ class TestListJobs:
         assert list_jobs(repository_name="missing_repo") == []
         mock.assert_called_once()
 
-    def test_filters_propagate_environment_to_every_query(self, monkeypatch):
+    def test_filters_propagate_environment_to_every_query(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         mock = MagicMock(
             side_effect=[
                 {
@@ -169,7 +223,7 @@ class TestListJobs:
                     }
                 },
                 {
-                    "repositoriesOrError": {
+                    "repository0": {
                         "nodes": [
                             self._repository(
                                 "example_repo", "example_location", "example_job"
@@ -184,6 +238,34 @@ class TestListJobs:
         list_jobs(env="staging", repository_name="example_repo")
 
         assert [call.kwargs["env"] for call in mock.call_args_list] == ["staging", "staging"]
+
+    def test_null_description_is_normalized_to_empty_string(
+        self, mock_gql: _MockGql
+    ) -> None:
+        repository = self._repository("repo", "location", "job")
+        repository["jobs"][0]["description"] = None
+        mock_gql({"data": {"repositoriesOrError": {"nodes": [repository]}}})
+
+        assert list_jobs()[0]["description"] == ""
+
+    def test_fastmcp_publishes_exact_output_schema(self) -> None:
+        tools = asyncio.run(server.mcp.list_tools())
+        tool = next(tool for tool in tools if tool.name == "list_jobs")
+        result_schema = tool.output_schema["properties"]["result"]
+
+        assert result_schema["type"] == "array"
+        assert result_schema["items"]["properties"] == {
+            "repository": {"type": "string"},
+            "location": {"type": "string"},
+            "job": {"type": "string"},
+            "description": {"type": "string"},
+        }
+        assert result_schema["items"]["required"] == [
+            "repository",
+            "location",
+            "job",
+            "description",
+        ]
 
 
 class TestListSchedules:

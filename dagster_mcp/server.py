@@ -3,6 +3,8 @@
 import bisect
 import json
 import os
+from typing import Any, Final, Mapping, Sequence, TypedDict
+
 import httpx
 from fastmcp import FastMCP
 
@@ -1169,7 +1171,16 @@ def get_asset_health(asset_key_or_group: str, env: str | None = None) -> list[di
 # ── Jobs & Schedules & Sensors ────────────────────────────────────────────────
 
 
-_LIST_JOBS_QUERY = """
+class JobInfo(TypedDict):
+    """Public job metadata returned by :func:`list_jobs`."""
+
+    repository: str
+    location: str
+    job: str
+    description: str
+
+
+_LIST_JOBS_QUERY: Final[str] = """
 query ListJobs {
   repositoriesOrError {
     ... on RepositoryConnection {
@@ -1187,7 +1198,7 @@ query ListJobs {
 }
 """
 
-_LIST_JOB_REPOSITORIES_QUERY = """
+_LIST_JOB_REPOSITORIES_QUERY: Final[str] = """
 query ListJobRepositories {
   repositoriesOrError {
     ... on RepositoryConnection {
@@ -1201,28 +1212,28 @@ query ListJobRepositories {
 }
 """
 
-_LIST_REPOSITORY_JOBS_QUERY = """
-query ListRepositoryJobs($repositorySelector: RepositorySelector!) {
-  repositoriesOrError(repositorySelector: $repositorySelector) {
-    ... on RepositoryConnection {
-      nodes {
-        name
-        location { name }
-        jobs {
-          name
-          description
-        }
-      }
+_LIST_REPOSITORY_JOBS_QUERY: Final[str] = """
+query ListRepositoryJobs(%s) {
+%s
+}
+fragment RepositoryJobsConnection on RepositoryConnection {
+  nodes {
+    name
+    location { name }
+    jobs {
+      name
+      description
     }
-    ... on PythonError { message }
   }
 }
 """
 
 
-def _jobs_from_repositories(repositories: list[dict]) -> list[dict]:
+def _jobs_from_repositories(
+    repositories: Sequence[Mapping[str, Any]],
+) -> list[JobInfo]:
     """Flatten repository job metadata into the public list_jobs schema."""
-    result = []
+    result: list[JobInfo] = []
     for repo in repositories:
         for job in repo.get("jobs", []):
             result.append(
@@ -1230,26 +1241,43 @@ def _jobs_from_repositories(repositories: list[dict]) -> list[dict]:
                     "repository": repo["name"],
                     "location": repo["location"]["name"],
                     "job": job["name"],
-                    "description": job.get("description", ""),
+                    "description": job.get("description") or "",
                 }
             )
     return result
 
 
 def _repository_jobs(
-    repository_name: str, location_name: str, env: str | None
-) -> list[dict]:
-    selector = {
-        "repositoryName": repository_name,
-        "repositoryLocationName": location_name,
-    }
-    data = gql(
-        _LIST_REPOSITORY_JOBS_QUERY,
-        {"repositorySelector": selector},
-        env=env,
+    selectors: Sequence[Mapping[str, str]], env: str | None
+) -> list[JobInfo]:
+    variable_definitions = ", ".join(
+        f"$repositorySelector{index}: RepositorySelector!"
+        for index in range(len(selectors))
     )
-    repositories = data.get("repositoriesOrError", {}).get("nodes", [])
-    return _jobs_from_repositories(repositories)
+    repository_fields = "\n".join(
+        f"""  repository{index}: repositoriesOrError(
+    repositorySelector: $repositorySelector{index}
+  ) {{
+    ...RepositoryJobsConnection
+    ... on PythonError {{ message }}
+  }}"""
+        for index in range(len(selectors))
+    )
+    query = _LIST_REPOSITORY_JOBS_QUERY % (
+        variable_definitions,
+        repository_fields,
+    )
+    variables = {
+        f"repositorySelector{index}": dict(selector)
+        for index, selector in enumerate(selectors)
+    }
+    data = gql(query, variables, env=env)
+
+    result: list[JobInfo] = []
+    for index in range(len(selectors)):
+        repositories = data.get(f"repository{index}", {}).get("nodes", [])
+        result.extend(_jobs_from_repositories(repositories))
+    return result
 
 
 @mcp.tool()
@@ -1257,7 +1285,7 @@ def list_jobs(
     env: str | None = None,
     repository_name: str | None = None,
     location_name: str | None = None,
-) -> list[dict]:
+) -> list[JobInfo]:
     """List jobs across code locations, optionally filtered by repository or location.
 
     Returns per job: repository name, code location name, job name, and description.
@@ -1268,7 +1296,15 @@ def list_jobs(
     exact job name and repository_location needed for launch_job.
     """
     if repository_name is not None and location_name is not None:
-        return _repository_jobs(repository_name, location_name, env)
+        return _repository_jobs(
+            [
+                {
+                    "repositoryName": repository_name,
+                    "repositoryLocationName": location_name,
+                }
+            ],
+            env,
+        )
 
     if repository_name is None and location_name is None:
         data = gql(_LIST_JOBS_QUERY, env=env)
@@ -1284,10 +1320,16 @@ def list_jobs(
         and (location_name is None or repo["location"]["name"] == location_name)
     ]
 
-    result = []
-    for repo in matches:
-        result.extend(_repository_jobs(repo["name"], repo["location"]["name"], env))
-    return result
+    selectors = [
+        {
+            "repositoryName": repo["name"],
+            "repositoryLocationName": repo["location"]["name"],
+        }
+        for repo in matches
+    ]
+    if not selectors:
+        return []
+    return _repository_jobs(selectors, env)
 
 
 @mcp.tool()
