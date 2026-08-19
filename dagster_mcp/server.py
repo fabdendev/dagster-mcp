@@ -1256,7 +1256,9 @@ def _repository_jobs(
         f"""  repository{index}: repositoriesOrError(
     repositorySelector: $repositorySelector{index}
   ) {{
+    __typename
     ...RepositoryJobsConnection
+    ... on RepositoryNotFoundError {{ message }}
     ... on PythonError {{ message }}
   }}"""
         for index in range(len(selectors))
@@ -1272,9 +1274,44 @@ def _repository_jobs(
     data = gql(query, variables, env=env)
 
     result: list[JobInfo] = []
-    for index in range(len(selectors)):
-        repositories = data.get(f"repository{index}", {}).get("nodes", [])
-        result.extend(_jobs_from_repositories(repositories))
+    for index, selector in enumerate(selectors):
+        field_name = f"repository{index}"
+        response = data.get(field_name)
+        if not isinstance(response, Mapping):
+            raise RuntimeError(
+                f"Malformed Dagster response for repository "
+                f"{selector['repositoryName']!r} at location "
+                f"{selector['repositoryLocationName']!r}: "
+                f"expected {field_name} to contain a union result"
+            )
+
+        typename = response.get("__typename")
+        if typename == "RepositoryConnection":
+            repositories = response.get("nodes")
+            if not isinstance(repositories, list):
+                raise RuntimeError(
+                    f"Malformed Dagster RepositoryConnection for repository "
+                    f"{selector['repositoryName']!r} at location "
+                    f"{selector['repositoryLocationName']!r}: missing nodes"
+                )
+            result.extend(_jobs_from_repositories(repositories))
+        elif typename == "RepositoryNotFoundError":
+            continue
+        elif typename == "PythonError":
+            message = response.get("message")
+            if not isinstance(message, str):
+                message = "No error message was provided"
+            raise RuntimeError(
+                f"Dagster failed to load repository "
+                f"{selector['repositoryName']!r} at location "
+                f"{selector['repositoryLocationName']!r}: {message}"
+            )
+        else:
+            raise RuntimeError(
+                f"Unexpected Dagster repositoriesOrError typename {typename!r} "
+                f"for repository {selector['repositoryName']!r} at location "
+                f"{selector['repositoryLocationName']!r}"
+            )
     return result
 
 

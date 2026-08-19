@@ -73,11 +73,13 @@ class TestListJobs:
                 {"repositoriesOrError": {"nodes": repositories}},
                 {
                     "repository1": {
+                        "__typename": "RepositoryConnection",
                         "nodes": [
                             self._repository("example_repo", "south", "south_job")
                         ]
                     },
                     "repository0": {
+                        "__typename": "RepositoryConnection",
                         "nodes": [self._repository("example_repo", "north", "north_job")]
                     }
                 },
@@ -99,6 +101,9 @@ class TestListJobs:
         assert "repository1: repositoriesOrError" in query
         assert "$repositorySelector0: RepositorySelector!" in query
         assert "$repositorySelector1: RepositorySelector!" in query
+        assert "__typename" in query
+        assert "... on RepositoryNotFoundError { message }" in query
+        assert "... on PythonError { message }" in query
         assert variables == {
             "repositorySelector0": {
                 "repositoryName": "example_repo",
@@ -123,9 +128,11 @@ class TestListJobs:
                 {"repositoriesOrError": {"nodes": repositories}},
                 {
                     "repository0": {
+                        "__typename": "RepositoryConnection",
                         "nodes": [self._repository("alpha", "example_location", "alpha_job")]
                     },
                     "repository1": {
+                        "__typename": "RepositoryConnection",
                         "nodes": [self._repository("beta", "example_location", "beta_job")]
                     },
                 },
@@ -155,6 +162,7 @@ class TestListJobs:
         mock = MagicMock(
             return_value={
                 "repository0": {
+                    "__typename": "RepositoryConnection",
                     "nodes": [
                         self._repository("example_repo", "example_location", "selected_job")
                     ]
@@ -184,7 +192,7 @@ class TestListJobs:
         mock = MagicMock(
             return_value={
                 "repository0": {
-                    "__typename": "PythonError",
+                    "__typename": "RepositoryNotFoundError",
                     "message": "Repository not found",
                 }
             }
@@ -198,6 +206,101 @@ class TestListJobs:
 
         assert result == []
         mock.assert_called_once()
+
+    def test_python_error_for_single_selector_raises_with_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repository0": {
+                    "__typename": "PythonError",
+                    "message": "User code failed to load",
+                }
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "Dagster failed to load repository 'example_repo' at location "
+                "'example_location': User code failed to load"
+            ),
+        ):
+            list_jobs(
+                repository_name="example_repo",
+                location_name="example_location",
+            )
+
+    def test_python_error_for_one_of_multiple_selectors_does_not_return_partial_jobs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repositories = [
+            self._repository("example_repo", "north"),
+            self._repository("example_repo", "south"),
+        ]
+        mock = MagicMock(
+            side_effect=[
+                {"repositoriesOrError": {"nodes": repositories}},
+                {
+                    "repository0": {
+                        "__typename": "RepositoryConnection",
+                        "nodes": [
+                            self._repository("example_repo", "north", "north_job")
+                        ],
+                    },
+                    "repository1": {
+                        "__typename": "PythonError",
+                        "message": "South location import failed",
+                    },
+                },
+            ]
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "Dagster failed to load repository 'example_repo' at location "
+                "'south': South location import failed"
+            ),
+        ):
+            list_jobs(repository_name="example_repo")
+
+    @pytest.mark.parametrize(
+        "response, expected",
+        [
+            pytest.param(
+                {},
+                "Unexpected Dagster repositoriesOrError typename None",
+                id="missing-typename",
+            ),
+            pytest.param(
+                {"__typename": "FutureRepositoryError"},
+                "Unexpected Dagster repositoriesOrError typename 'FutureRepositoryError'",
+                id="unknown-typename",
+            ),
+            pytest.param(
+                {"__typename": "RepositoryConnection"},
+                "Malformed Dagster RepositoryConnection",
+                id="connection-without-nodes",
+            ),
+        ],
+    )
+    def test_unexpected_repository_union_response_raises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        response: dict[str, object],
+        expected: str,
+    ) -> None:
+        monkeypatch.setattr(
+            server,
+            "gql",
+            MagicMock(return_value={"repository0": response}),
+        )
+
+        with pytest.raises(RuntimeError, match=expected):
+            list_jobs(repository_name="repo", location_name="location")
 
     def test_single_filter_with_no_matches_does_not_fetch_jobs(
         self, monkeypatch: pytest.MonkeyPatch

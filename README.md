@@ -303,7 +303,10 @@ require Dagster 1.9+.
 example, `list_jobs(repository_name="example_repository")` finds that repository
 across locations, while
 `list_jobs(repository_name="example_repository", location_name="example_location")`
-targets one repository and code-location pair.
+targets one repository and code-location pair. Calls with only one filter use a
+lightweight repository-discovery request followed by one batched job request.
+This extra round-trip substantially reduces payload size when only a subset of
+repositories matches.
 
 ### Instance & Code Locations
 
@@ -391,4 +394,3 @@ uv run python -m dagster_mcp      # start server locally
 ## License
 
 MIT
-
