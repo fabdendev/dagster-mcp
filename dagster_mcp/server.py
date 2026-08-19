@@ -1183,6 +1183,7 @@ class JobInfo(TypedDict):
 _LIST_JOBS_QUERY: Final[str] = """
 query ListJobs {
   repositoriesOrError {
+    __typename
     ... on RepositoryConnection {
       nodes {
         name
@@ -1193,6 +1194,7 @@ query ListJobs {
         }
       }
     }
+    ... on RepositoryNotFoundError { message }
     ... on PythonError { message }
   }
 }
@@ -1201,12 +1203,14 @@ query ListJobs {
 _LIST_JOB_REPOSITORIES_QUERY: Final[str] = """
 query ListJobRepositories {
   repositoriesOrError {
+    __typename
     ... on RepositoryConnection {
       nodes {
         name
         location { name }
       }
     }
+    ... on RepositoryNotFoundError { message }
     ... on PythonError { message }
   }
 }
@@ -1245,6 +1249,40 @@ def _jobs_from_repositories(
     ]
 
 
+def _repository_nodes(response: object, context: str) -> list[Mapping[str, Any]]:
+    """Decode and validate a Dagster ``RepositoriesOrError`` union result."""
+    if not isinstance(response, Mapping):
+        raise RuntimeError(
+            f"Malformed Dagster repositoriesOrError response while {context}: "
+            "expected a union result"
+        )
+
+    typename = response.get("__typename")
+    if typename == "RepositoryConnection":
+        nodes = response.get("nodes")
+        if not isinstance(nodes, list) or any(
+            not isinstance(node, Mapping) for node in nodes
+        ):
+            raise RuntimeError(
+                f"Malformed Dagster RepositoryConnection while {context}: "
+                "expected nodes to be a list of repositories"
+            )
+        return nodes
+
+    if typename == "RepositoryNotFoundError":
+        return []
+
+    if typename == "PythonError":
+        message = response.get("message")
+        if not isinstance(message, str):
+            message = "No error message was provided"
+        raise RuntimeError(f"Dagster failed while {context}: {message}")
+
+    raise RuntimeError(
+        f"Unexpected Dagster repositoriesOrError typename {typename!r} while {context}"
+    )
+
+
 def _repository_jobs(
     selectors: Sequence[Mapping[str, str]], env: str | None
 ) -> list[JobInfo]:
@@ -1275,43 +1313,12 @@ def _repository_jobs(
 
     result: list[JobInfo] = []
     for index, selector in enumerate(selectors):
-        field_name = f"repository{index}"
-        response = data.get(field_name)
-        if not isinstance(response, Mapping):
-            raise RuntimeError(
-                f"Malformed Dagster response for repository "
-                f"{selector['repositoryName']!r} at location "
-                f"{selector['repositoryLocationName']!r}: "
-                f"expected {field_name} to contain a union result"
-            )
-
-        typename = response.get("__typename")
-        if typename == "RepositoryConnection":
-            repositories = response.get("nodes")
-            if not isinstance(repositories, list):
-                raise RuntimeError(
-                    f"Malformed Dagster RepositoryConnection for repository "
-                    f"{selector['repositoryName']!r} at location "
-                    f"{selector['repositoryLocationName']!r}: missing nodes"
-                )
-            result.extend(_jobs_from_repositories(repositories))
-        elif typename == "RepositoryNotFoundError":
-            continue
-        elif typename == "PythonError":
-            message = response.get("message")
-            if not isinstance(message, str):
-                message = "No error message was provided"
-            raise RuntimeError(
-                f"Dagster failed to load repository "
-                f"{selector['repositoryName']!r} at location "
-                f"{selector['repositoryLocationName']!r}: {message}"
-            )
-        else:
-            raise RuntimeError(
-                f"Unexpected Dagster repositoriesOrError typename {typename!r} "
-                f"for repository {selector['repositoryName']!r} at location "
-                f"{selector['repositoryLocationName']!r}"
-            )
+        repositories = _repository_nodes(
+            data.get(f"repository{index}"),
+            f"loading repository {selector['repositoryName']!r} at location "
+            f"{selector['repositoryLocationName']!r}",
+        )
+        result.extend(_jobs_from_repositories(repositories))
     return result
 
 
@@ -1343,11 +1350,18 @@ def list_jobs(
 
     if repository_name is None and location_name is None:
         data = gql(_LIST_JOBS_QUERY, env=env)
-        repositories = data.get("repositoriesOrError", {}).get("nodes", [])
+        repositories = _repository_nodes(
+            data.get("repositoriesOrError"), "listing jobs"
+        )
         return _jobs_from_repositories(repositories)
 
     data = gql(_LIST_JOB_REPOSITORIES_QUERY, env=env)
-    repositories = data.get("repositoriesOrError", {}).get("nodes", [])
+    discovery_context = (
+        f"discovering repositories for list_jobs with repository {repository_name!r}"
+        if repository_name is not None
+        else f"discovering repositories for list_jobs at location {location_name!r}"
+    )
+    repositories = _repository_nodes(data.get("repositoriesOrError"), discovery_context)
     matches = [
         repo
         for repo in repositories
