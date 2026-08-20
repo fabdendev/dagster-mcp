@@ -3,6 +3,8 @@
 import bisect
 import json
 import os
+from typing import Any, Final, Mapping, Sequence, TypedDict
+
 import httpx
 from fastmcp import FastMCP
 
@@ -1169,46 +1171,382 @@ def get_asset_health(asset_key_or_group: str, env: str | None = None) -> list[di
 # ── Jobs & Schedules & Sensors ────────────────────────────────────────────────
 
 
+class JobInfo(TypedDict):
+    """Public job metadata returned by :func:`list_jobs`."""
+
+    repository: str
+    location: str
+    job: str
+    description: str
+
+
+_LIST_JOBS_QUERY: Final[str] = """
+query ListJobs {
+  repositoriesOrError {
+    __typename
+    ... on RepositoryConnection {
+      nodes {
+        name
+        location { name }
+        jobs {
+          name
+          description
+        }
+      }
+    }
+    ... on RepositoryNotFoundError { message }
+    ... on PythonError { message }
+  }
+}
+"""
+
+# Rides along in the same request as repositoriesOrError so a failed or
+# still-loading code location can be told apart from "no such repository"
+# at no extra round-trip. Identical shape at Dagster 1.7.16 and 1.13.15.
+_WORKSPACE_LOAD_STATUS_SELECTION: Final[str] = """  workspaceOrError {
+    __typename
+    ... on Workspace {
+      locationEntries {
+        name
+        loadStatus
+        locationOrLoadError {
+          __typename
+          ... on PythonError { message }
+        }
+      }
+    }
+    ... on PythonError { message }
+  }"""
+
+_LIST_JOB_REPOSITORIES_QUERY: Final[str] = (
+    """
+query ListJobRepositories {
+  repositoriesOrError {
+    __typename
+    ... on RepositoryConnection {
+      nodes {
+        name
+        location { name }
+      }
+    }
+    ... on RepositoryNotFoundError { message }
+    ... on PythonError { message }
+  }
+"""
+    + _WORKSPACE_LOAD_STATUS_SELECTION
+    + """
+}
+"""
+)
+
+_LIST_REPOSITORY_JOBS_QUERY: Final[str] = (
+    """
+query ListRepositoryJobs(%s) {
+%s
+"""
+    + _WORKSPACE_LOAD_STATUS_SELECTION
+    + """
+}
+fragment RepositoryJobsConnection on RepositoryConnection {
+  nodes {
+    name
+    location { name }
+    jobs {
+      name
+      description
+    }
+  }
+}
+"""
+)
+
+
+def _jobs_from_repositories(
+    repositories: Sequence[Mapping[str, Any]],
+) -> list[JobInfo]:
+    """Flatten repository job metadata into the public list_jobs schema."""
+    return [
+        JobInfo(
+            repository=repo["name"],
+            location=repo["location"]["name"],
+            job=job["name"],
+            description=job.get("description") or "",
+        )
+        for repo in repositories
+        for job in repo.get("jobs", [])
+    ]
+
+
+def _location_unavailable_reason(entry: object) -> tuple[str, str] | None:
+    """Return ``(name, reason)`` when a workspace location entry is unavailable.
+
+    A location is healthy if either signal says so: its ``locationOrLoadError``
+    resolves to a ``RepositoryLocation``, or its ``loadStatus`` is ``LOADED``.
+    ``None`` also covers "this entry is too malformed to say anything about" —
+    the caller records nothing either way.
+    """
+    if not isinstance(entry, Mapping):
+        return None
+    name = entry.get("name")
+    if not isinstance(name, str):
+        return None
+
+    location_or_error = entry.get("locationOrLoadError")
+    typename = (
+        location_or_error.get("__typename")
+        if isinstance(location_or_error, Mapping)
+        else None
+    )
+    if typename == "RepositoryLocation":
+        return None
+
+    if typename == "PythonError":
+        message = location_or_error.get("message")
+        if not isinstance(message, str) or not message:
+            message = "Dagster did not provide an error message"
+        return name, message
+
+    load_status = entry.get("loadStatus")
+    if load_status == "LOADED":
+        # Loaded, and not a PythonError: treat as available. An added or
+        # renamed locationOrLoadError member must not read as an outage —
+        # that would raise for every healthy location.
+        return None
+    status = load_status if isinstance(load_status, str) else "UNKNOWN"
+    return name, f"code location is still loading (loadStatus={status})"
+
+
+def _unavailable_code_locations(data: Mapping[str, Any]) -> dict[str, str]:
+    """Map code-location name -> why it is unavailable, for locations Dagster cannot serve.
+
+    Diagnostic data only: any non-``Workspace`` result, or malformed shape,
+    yields ``{}`` ("nothing known") rather than raising, so this can never
+    turn a working call into a failure.
+    """
+    workspace = data.get("workspaceOrError")
+    if not isinstance(workspace, Mapping) or workspace.get("__typename") != "Workspace":
+        return {}
+
+    entries = workspace.get("locationEntries")
+    if not isinstance(entries, list):
+        return {}
+
+    unavailable: dict[str, str] = {}
+    for entry in entries:
+        resolved = _location_unavailable_reason(entry)
+        if resolved is not None:
+            name, reason = resolved
+            unavailable[name] = reason
+    return unavailable
+
+
+def _repository_nodes(
+    response: object,
+    context: str,
+    *,
+    not_found_message: str | None = None,
+) -> list[Mapping[str, Any]]:
+    """Decode and validate a Dagster ``RepositoriesOrError`` union result.
+
+    ``not_found_message``, when given, is raised instead of the default
+    "no match" empty list on ``RepositoryNotFoundError`` — used when a
+    relevant code location is known to be unavailable, so callers don't
+    have to duplicate that raise themselves.
+    """
+    if not isinstance(response, Mapping):
+        raise RuntimeError(
+            f"Malformed Dagster repositoriesOrError response while {context}: "
+            "expected a union result"
+        )
+
+    typename = response.get("__typename")
+    if typename == "RepositoryConnection":
+        nodes = response.get("nodes")
+        if not isinstance(nodes, list) or any(
+            not isinstance(node, Mapping) for node in nodes
+        ):
+            raise RuntimeError(
+                f"Malformed Dagster RepositoryConnection while {context}: "
+                "expected nodes to be a list of repositories"
+            )
+        return nodes
+
+    if typename == "RepositoryNotFoundError":
+        if not_found_message is not None:
+            raise RuntimeError(not_found_message)
+        return []
+
+    if typename == "PythonError":
+        message = response.get("message")
+        if not isinstance(message, str):
+            message = "No error message was provided"
+        raise RuntimeError(f"Dagster failed while {context}: {message}")
+
+    raise RuntimeError(
+        f"Unexpected Dagster repositoriesOrError typename {typename!r} while {context}"
+    )
+
+
+def _repository_jobs(
+    selectors: Sequence[Mapping[str, str]],
+    env: str | None,
+    *,
+    discovered: bool = False,
+) -> list[JobInfo]:
+    """Fetch jobs for each repository selector in one batched request.
+
+    ``discovered`` marks selectors sourced from a successful discovery
+    request moments earlier: a ``RepositoryNotFoundError`` there means the
+    code location went away mid-call, so it always raises. Otherwise a
+    ``RepositoryNotFoundError`` only raises when ``workspaceOrError`` (fetched
+    in the same request) shows that selector's code location is unavailable —
+    a load failure or still-loading location must not silently look like "no
+    such repository".
+    """
+    variable_definitions = ", ".join(
+        f"$repositorySelector{index}: RepositorySelector!"
+        for index in range(len(selectors))
+    )
+    repository_fields = "\n".join(
+        f"""  repository{index}: repositoriesOrError(
+    repositorySelector: $repositorySelector{index}
+  ) {{
+    __typename
+    ...RepositoryJobsConnection
+    ... on RepositoryNotFoundError {{ message }}
+    ... on PythonError {{ message }}
+  }}"""
+        for index in range(len(selectors))
+    )
+    query = _LIST_REPOSITORY_JOBS_QUERY % (
+        variable_definitions,
+        repository_fields,
+    )
+    variables = {
+        f"repositorySelector{index}": dict(selector)
+        for index, selector in enumerate(selectors)
+    }
+    data = gql(query, variables, env=env)
+    unavailable = _unavailable_code_locations(data)
+
+    result: list[JobInfo] = []
+    for index, selector in enumerate(selectors):
+        repository_name = selector["repositoryName"]
+        location_name = selector["repositoryLocationName"]
+        context = (
+            f"loading repository {repository_name!r} at location {location_name!r}"
+        )
+        if discovered:
+            not_found_message = (
+                f"Repository {repository_name!r} at code location "
+                f"{location_name!r} was found during discovery moments earlier "
+                "but is no longer available. The code location may have "
+                "reloaded or failed between requests — check list_code_locations."
+            )
+        elif location_name in unavailable:
+            not_found_message = (
+                f"Code location {location_name!r} is unavailable "
+                f"({unavailable[location_name]}); list_jobs cannot confirm "
+                f"whether repository {repository_name!r} exists there. "
+                "Check list_code_locations for details."
+            )
+        else:
+            not_found_message = None
+
+        repositories = _repository_nodes(
+            data.get(f"repository{index}"),
+            context,
+            not_found_message=not_found_message,
+        )
+        result.extend(_jobs_from_repositories(repositories))
+    return result
+
+
 @mcp.tool()
-def list_jobs(env: str | None = None) -> list[dict]:
-    """List all jobs across all code locations. Use this to discover available jobs.
+def list_jobs(
+    env: str | None = None,
+    repository_name: str | None = None,
+    location_name: str | None = None,
+) -> list[JobInfo]:
+    """List jobs across code locations, optionally filtered by repository or location.
 
     Returns per job: repository name, code location name, job name, and description.
+    repository_name and location_name are independent exact-match filters; when
+    both are supplied, a job must match both.
+
+    An empty result when filtering means no match was found among loaded code
+    locations. If a code location relevant to the filter failed to load or is
+    still loading, list_jobs raises instead of silently reporting no jobs —
+    check list_code_locations for details. Calling with no filters lists
+    whatever is loaded and never raises for a broken location; use
+    list_code_locations or get_instance_status to check load health directly.
 
     When to use: as a starting point to explore what jobs exist, or to find the
     exact job name and repository_location needed for launch_job.
     """
-    query = """
-    query ListJobs {
-      repositoriesOrError {
-        ... on RepositoryConnection {
-          nodes {
-            name
-            location { name }
-            jobs {
-              name
-              description
-            }
-          }
-        }
-        ... on PythonError { message }
-      }
-    }
-    """
-    data = gql(query, env=env)
-    repos = data.get("repositoriesOrError", {}).get("nodes", [])
-    result = []
-    for repo in repos:
-        for job in repo.get("jobs", []):
-            result.append(
+    if repository_name is not None and location_name is not None:
+        return _repository_jobs(
+            [
                 {
-                    "repository": repo["name"],
-                    "location": repo["location"]["name"],
-                    "job": job["name"],
-                    "description": job.get("description", ""),
+                    "repositoryName": repository_name,
+                    "repositoryLocationName": location_name,
                 }
+            ],
+            env,
+        )
+
+    if repository_name is None and location_name is None:
+        data = gql(_LIST_JOBS_QUERY, env=env)
+        repositories = _repository_nodes(
+            data.get("repositoriesOrError"), "listing jobs"
+        )
+        return _jobs_from_repositories(repositories)
+
+    data = gql(_LIST_JOB_REPOSITORIES_QUERY, env=env)
+    discovery_context = (
+        f"discovering repositories for list_jobs with repository {repository_name!r}"
+        if repository_name is not None
+        else f"discovering repositories for list_jobs at location {location_name!r}"
+    )
+    repositories = _repository_nodes(data.get("repositoriesOrError"), discovery_context)
+    matches = [
+        repo
+        for repo in repositories
+        if (repository_name is None or repo["name"] == repository_name)
+        and (location_name is None or repo["location"]["name"] == location_name)
+    ]
+
+    # Exactly one filter is set here: both-set and both-None returned above.
+    unavailable = _unavailable_code_locations(data)
+    if location_name is not None:
+        if location_name in unavailable:
+            raise RuntimeError(
+                f"Code location {location_name!r} is unavailable "
+                f"({unavailable[location_name]}); list_jobs cannot confirm whether "
+                "it contains matching jobs. Check list_code_locations for details."
             )
-    return result
+    elif not matches and unavailable:
+        locations_desc = ", ".join(
+            f"{name!r} ({reason})" for name, reason in sorted(unavailable.items())
+        )
+        raise RuntimeError(
+            f"No repository named {repository_name!r} was found among loaded "
+            "code locations, but the following code locations are unavailable "
+            f"and could not be searched: {locations_desc}. Repository "
+            f"{repository_name!r} may exist there — check list_code_locations "
+            "for details."
+        )
+
+    selectors = [
+        {
+            "repositoryName": repo["name"],
+            "repositoryLocationName": repo["location"]["name"],
+        }
+        for repo in matches
+    ]
+    if not selectors:
+        return []
+    return _repository_jobs(selectors, env, discovered=True)
 
 
 @mcp.tool()

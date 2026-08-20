@@ -154,7 +154,15 @@ class TestToolsWithEnvParam:
 
     def test_list_jobs_passes_env_to_gql(self, monkeypatch):
         monkeypatch.setattr(server, "_ENVS", json.loads(_TWO_ENVS))
-        mock_post = self._mock_post(monkeypatch, {"repositoriesOrError": {"nodes": []}})
+        mock_post = self._mock_post(
+            monkeypatch,
+            {
+                "repositoriesOrError": {
+                    "__typename": "RepositoryConnection",
+                    "nodes": [],
+                }
+            },
+        )
 
         list_jobs(env="dev")
 

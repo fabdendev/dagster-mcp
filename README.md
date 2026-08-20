@@ -47,7 +47,7 @@ Agent: Stopping it until the upstream fix lands...
 |----------|-------|---------------------|
 | **Runs** | `get_runs` `get_run_status` `get_run_logs` `get_run_stats` `get_run_failure_summary` | Find failures, diagnose root causes, inspect logs and step timing |
 | **Assets** | `search_assets` `resolve_asset_selection` `get_asset_details` `get_recent_materializations` `get_asset_health` | Discover assets, preview lineage selections, check freshness, detect stale data |
-| **Jobs** | `list_jobs` | Inventory all jobs across code locations |
+| **Jobs** | `list_jobs` | Inventory jobs across code locations, with optional repository/location filters |
 | **Schedules & Sensors** | `list_schedules` `list_sensors` `get_tick_history` | Detect silent failures, missed ticks, sensor errors |
 | **Instance** | `get_instance_status` `list_code_locations` `list_backfills` | Global health check, daemon status, code location errors |
 | **Actions** | `materialize_assets` `backfill_assets` `launch_job` `launch_job_with_partitions` `terminate_run` `start_schedule` `stop_schedule` `start_sensor` `stop_sensor` `reload_code_location` | Materialize concrete assets with config, backfill partitions, launch jobs, stop stuck runs, start or stop schedules and sensors, reload after deploy |
@@ -294,10 +294,35 @@ require Dagster 1.9+.
 
 | Tool | Description |
 |------|-------------|
-| `list_jobs` | List all jobs across all code locations (use to find names for `launch_job`) |
+| `list_jobs` | List jobs across code locations, optionally filtered by exact `repository_name` and/or `location_name` (use to find names for `launch_job`) |
 | `list_schedules` | List schedules with status (RUNNING/STOPPED), cron, target job, next tick |
 | `list_sensors` | List sensors with status and target jobs |
 | `get_tick_history` | Tick-by-tick history for a schedule or sensor — **essential for detecting silent failures**. Accepts optional `repository_name` / `location_name` to disambiguate a name shared by several code locations |
+
+`list_jobs` filters are independent and use AND semantics when combined. For
+example, `list_jobs(repository_name="example_repository")` finds that repository
+across locations, while
+`list_jobs(repository_name="example_repository", location_name="example_location")`
+targets one repository and code-location pair. Calls with only one filter use a
+lightweight repository-discovery request followed by one batched job request —
+it isn't free: that's a second round-trip against Dagster, traded for a
+smaller payload when only a subset of repositories matches. Request counts
+per call: 1 for no filters, 1 for both filters, 2 for exactly one filter.
+
+If a code location relevant to the filter failed to load or is still loading,
+`list_jobs` raises a `RuntimeError` naming the location instead of silently
+returning an empty result — an empty filtered result means no match among
+code locations Dagster could actually load. A non-empty filtered result can
+still be incomplete: if some repositories matched, `list_jobs` returns them
+rather than raising, even when another code location could not be searched.
+This check rides along in the same requests above (`workspaceOrError`, which
+`list_code_locations` already queries), so it adds no extra round-trip. The
+unfiltered call
+(`list_jobs()` with no filters) is unchanged: it omits this check and keeps
+returning whatever is loaded, since an agent won't misread a long inventory
+listing as "nothing exists" the way it would misread an empty filtered
+result — use `list_code_locations` or `get_instance_status` to check load
+health directly.
 
 ### Instance & Code Locations
 

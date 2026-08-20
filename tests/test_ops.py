@@ -1,29 +1,643 @@
+import asyncio
+from unittest.mock import MagicMock
+
 import pytest
 
+from dagster_mcp import server
 from dagster_mcp.server import list_jobs, list_schedules, list_sensors, get_tick_history
 
 
 class TestListJobs:
-    def test_jobs_across_repos(self, mock_gql):
-        mock_gql({"data": {"repositoriesOrError": {"nodes": [
-            {"name": "repo1", "location": {"name": "loc1"}, "jobs": [
-                {"name": "job_a", "description": "Job A"},
-                {"name": "job_b", "description": ""},
-            ]},
-            {"name": "repo2", "location": {"name": "loc2"}, "jobs": [
-                {"name": "job_c", "description": "Job C"},
-            ]},
-        ]}}})
+    @staticmethod
+    def _repository(name: str, location: str, *jobs: str) -> dict[str, object]:
+        return {
+            "name": name,
+            "location": {"name": location},
+            "jobs": [
+                {"name": job, "description": f"Description for {job}"} for job in jobs
+            ],
+        }
+
+    @staticmethod
+    def _connection(*repositories: dict[str, object]) -> dict[str, object]:
+        return {"__typename": "RepositoryConnection", "nodes": list(repositories)}
+
+    @staticmethod
+    def _workspace(*entries: dict[str, object]) -> dict[str, object]:
+        return {"__typename": "Workspace", "locationEntries": list(entries)}
+
+    @staticmethod
+    def _loaded_entry(name: str) -> dict[str, object]:
+        return {
+            "name": name,
+            "loadStatus": "LOADED",
+            "locationOrLoadError": {"__typename": "RepositoryLocation"},
+        }
+
+    @staticmethod
+    def _failed_entry(name: str, message: str) -> dict[str, object]:
+        return {
+            "name": name,
+            "loadStatus": "LOADED",
+            "locationOrLoadError": {"__typename": "PythonError", "message": message},
+        }
+
+    @staticmethod
+    def _loading_entry(name: str) -> dict[str, object]:
+        return {"name": name, "loadStatus": "LOADING", "locationOrLoadError": None}
+
+    @staticmethod
+    def _assert_union_fields(query: str) -> None:
+        assert "__typename" in query
+        assert "... on RepositoryNotFoundError { message }" in query
+        assert "... on PythonError { message }" in query
+
+    def test_jobs_across_repos(self, mock_gql) -> None:
+        mock_post = mock_gql(
+            {
+                "data": {
+                    "repositoriesOrError": self._connection(
+                        {
+                            "name": "repo1",
+                            "location": {"name": "loc1"},
+                            "jobs": [
+                                {"name": "job_a", "description": "Job A"},
+                                {"name": "job_b", "description": ""},
+                            ],
+                        },
+                        {
+                            "name": "repo2",
+                            "location": {"name": "loc2"},
+                            "jobs": [
+                                {"name": "job_c", "description": "Job C"},
+                            ],
+                        },
+                    )
+                }
+            }
+        )
         result = list_jobs()
         assert len(result) == 3
         assert result[0] == {
-            "repository": "repo1", "location": "loc1",
-            "job": "job_a", "description": "Job A",
+            "repository": "repo1",
+            "location": "loc1",
+            "job": "job_a",
+            "description": "Job A",
+        }
+        self._assert_union_fields(mock_post.call_args.kwargs["json"]["query"])
+
+    def test_empty(self, mock_gql) -> None:
+        mock_gql({"data": {"repositoriesOrError": self._connection()}})
+        assert list_jobs() == []
+
+    def test_repository_filter_batches_exact_matches_in_stable_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repositories = [
+            self._repository("example_repo", "north"),
+            self._repository("example_repo", "south"),
+            self._repository("example_repo_archive", "north"),
+        ]
+        mock = MagicMock(
+            side_effect=[
+                {"repositoriesOrError": self._connection(*repositories)},
+                {
+                    "repository1": {
+                        "__typename": "RepositoryConnection",
+                        "nodes": [
+                            self._repository("example_repo", "south", "south_job")
+                        ],
+                    },
+                    "repository0": {
+                        "__typename": "RepositoryConnection",
+                        "nodes": [
+                            self._repository("example_repo", "north", "north_job")
+                        ],
+                    },
+                },
+            ]
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        result = list_jobs(env="staging", repository_name="example_repo")
+
+        assert [job["job"] for job in result] == ["north_job", "south_job"]
+        assert mock.call_count == 2
+        assert [call.kwargs["env"] for call in mock.call_args_list] == [
+            "staging",
+            "staging",
+        ]
+        assert "jobs {" not in mock.call_args_list[0].args[0]
+        query, variables = mock.call_args_list[1].args
+        assert "repository0: repositoriesOrError" in query
+        assert "repository1: repositoriesOrError" in query
+        assert "$repositorySelector0: RepositorySelector!" in query
+        assert "$repositorySelector1: RepositorySelector!" in query
+        self._assert_union_fields(query)
+        self._assert_union_fields(mock.call_args_list[0].args[0])
+        assert variables == {
+            "repositorySelector0": {
+                "repositoryName": "example_repo",
+                "repositoryLocationName": "north",
+            },
+            "repositorySelector1": {
+                "repositoryName": "example_repo",
+                "repositoryLocationName": "south",
+            },
         }
 
-    def test_empty(self, mock_gql):
-        mock_gql({"data": {"repositoriesOrError": {"nodes": []}}})
-        assert list_jobs() == []
+    def test_location_filter_batches_each_exact_match(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repositories = [
+            self._repository("alpha", "example_location"),
+            self._repository("beta", "example_location"),
+            self._repository("gamma", "example_location_archive"),
+        ]
+        mock = MagicMock(
+            side_effect=[
+                {"repositoriesOrError": self._connection(*repositories)},
+                {
+                    "repository0": {
+                        "__typename": "RepositoryConnection",
+                        "nodes": [
+                            self._repository("alpha", "example_location", "alpha_job")
+                        ],
+                    },
+                    "repository1": {
+                        "__typename": "RepositoryConnection",
+                        "nodes": [
+                            self._repository("beta", "example_location", "beta_job")
+                        ],
+                    },
+                },
+            ]
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        result = list_jobs(location_name="example_location")
+
+        assert [job["job"] for job in result] == ["alpha_job", "beta_job"]
+        assert mock.call_count == 2
+        variables = mock.call_args_list[1].args[1]
+        assert variables == {
+            "repositorySelector0": {
+                "repositoryName": "alpha",
+                "repositoryLocationName": "example_location",
+            },
+            "repositorySelector1": {
+                "repositoryName": "beta",
+                "repositoryLocationName": "example_location",
+            },
+        }
+
+    def test_combined_filters_use_one_server_side_selector(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repository0": {
+                    "__typename": "RepositoryConnection",
+                    "nodes": [
+                        self._repository(
+                            "example_repo", "example_location", "selected_job"
+                        )
+                    ],
+                }
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        result = list_jobs(
+            repository_name="example_repo",
+            location_name="example_location",
+        )
+
+        assert [job["job"] for job in result] == ["selected_job"]
+        query, variables = mock.call_args.args
+        assert "repository0: repositoriesOrError" in query
+        assert variables == {
+            "repositorySelector0": {
+                "repositoryName": "example_repo",
+                "repositoryLocationName": "example_location",
+            }
+        }
+
+    def test_combined_filters_with_no_match_return_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repository0": {
+                    "__typename": "RepositoryNotFoundError",
+                    "message": "Repository not found",
+                }
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        result = list_jobs(
+            repository_name="missing_repo",
+            location_name="missing_location",
+        )
+
+        assert result == []
+        mock.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "kwargs, context",
+        [
+            pytest.param({}, "listing jobs", id="unfiltered"),
+            pytest.param(
+                {"repository_name": "example_repo"},
+                "discovering repositories for list_jobs with repository 'example_repo'",
+                id="one-filter-discovery",
+            ),
+        ],
+    )
+    def test_python_error_during_listing_or_discovery_raises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        kwargs: dict[str, str],
+        context: str,
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repositoriesOrError": {
+                    "__typename": "PythonError",
+                    "message": "User code failed to load",
+                }
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(
+            RuntimeError,
+            match=f"Dagster failed while {context}: User code failed to load",
+        ):
+            list_jobs(**kwargs)
+
+    def test_python_error_for_one_of_multiple_selectors_does_not_return_partial_jobs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repositories = [
+            self._repository("example_repo", "north"),
+            self._repository("example_repo", "south"),
+        ]
+        mock = MagicMock(
+            side_effect=[
+                {"repositoriesOrError": self._connection(*repositories)},
+                {
+                    "repository0": {
+                        "__typename": "RepositoryConnection",
+                        "nodes": [
+                            self._repository("example_repo", "north", "north_job")
+                        ],
+                    },
+                    "repository1": {
+                        "__typename": "PythonError",
+                        "message": "South location import failed",
+                    },
+                },
+            ]
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "Dagster failed while loading repository 'example_repo' at location "
+                "'south': South location import failed"
+            ),
+        ):
+            list_jobs(repository_name="example_repo")
+
+    @pytest.mark.parametrize(
+        "response, expected",
+        [
+            pytest.param(
+                None,
+                "Malformed Dagster repositoriesOrError response",
+                id="non-mapping",
+            ),
+            pytest.param(
+                {"__typename": "RepositoryConnection"},
+                "Malformed Dagster RepositoryConnection",
+                id="connection-without-nodes",
+            ),
+            pytest.param(
+                {"__typename": "FutureRepositoryError"},
+                "Unexpected Dagster repositoriesOrError typename 'FutureRepositoryError'",
+                id="unknown-typename",
+            ),
+        ],
+    )
+    def test_unexpected_repository_union_response_raises(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        response: object,
+        expected: str,
+    ) -> None:
+        monkeypatch.setattr(
+            server,
+            "gql",
+            MagicMock(return_value={"repository0": response}),
+        )
+
+        with pytest.raises(RuntimeError, match=expected):
+            list_jobs(repository_name="repo", location_name="location")
+
+    def test_single_filter_with_no_matches_does_not_fetch_jobs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repositoriesOrError": self._connection(
+                    self._repository("available_repo", "example_location")
+                )
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        assert list_jobs(repository_name="missing_repo") == []
+        mock.assert_called_once()
+
+    def test_empty_description_is_normalized_to_empty_string(self, mock_gql) -> None:
+        repository = self._repository("repo", "location")
+        repository["jobs"] = [{"name": "job", "description": None}]
+        mock_gql({"data": {"repositoriesOrError": self._connection(repository)}})
+
+        assert list_jobs()[0]["description"] == ""
+
+    def test_both_filters_not_found_with_failed_location_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repository0": {
+                    "__typename": "RepositoryNotFoundError",
+                    "message": "Repository not found",
+                },
+                "workspaceOrError": self._workspace(
+                    self._failed_entry(
+                        "broken_loc", "ModuleNotFoundError: no module named 'foo'"
+                    )
+                ),
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            list_jobs(repository_name="example_repo", location_name="broken_loc")
+        message = str(exc_info.value)
+        assert "broken_loc" in message
+        assert "ModuleNotFoundError: no module named 'foo'" in message
+
+    def test_both_filters_not_found_with_all_locations_loaded_returns_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repository0": {
+                    "__typename": "RepositoryNotFoundError",
+                    "message": "Repository not found",
+                },
+                "workspaceOrError": self._workspace(
+                    self._loaded_entry("example_location")
+                ),
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        result = list_jobs(
+            repository_name="missing_repo", location_name="example_location"
+        )
+
+        assert result == []
+
+    def test_both_filters_not_found_with_loading_location_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repository0": {
+                    "__typename": "RepositoryNotFoundError",
+                    "message": "Repository not found",
+                },
+                "workspaceOrError": self._workspace(self._loading_entry("slow_loc")),
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            list_jobs(repository_name="example_repo", location_name="slow_loc")
+        message = str(exc_info.value)
+        assert "slow_loc" in message
+        assert "loading" in message.lower()
+
+    def test_location_only_unavailable_location_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repositoriesOrError": self._connection(),
+                "workspaceOrError": self._workspace(
+                    self._failed_entry("broken_loc", "ImportError: boom")
+                ),
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            list_jobs(location_name="broken_loc")
+        message = str(exc_info.value)
+        assert "broken_loc" in message
+        assert "ImportError: boom" in message
+        mock.assert_called_once()
+
+    def test_repository_only_no_matches_with_unavailable_location_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repositoriesOrError": self._connection(
+                    self._repository("other_repo", "healthy_loc")
+                ),
+                "workspaceOrError": self._workspace(
+                    self._loaded_entry("healthy_loc"),
+                    self._failed_entry("broken_loc", "ImportError: boom"),
+                ),
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            list_jobs(repository_name="missing_repo")
+        message = str(exc_info.value)
+        assert "broken_loc" in message
+        assert "ImportError: boom" in message
+        mock.assert_called_once()
+
+    def test_repository_only_with_matches_and_unrelated_unavailable_location_returns_jobs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            side_effect=[
+                {
+                    "repositoriesOrError": self._connection(
+                        self._repository("example_repo", "healthy_loc")
+                    ),
+                    "workspaceOrError": self._workspace(
+                        self._loaded_entry("healthy_loc"),
+                        self._failed_entry("broken_loc", "ImportError: boom"),
+                    ),
+                },
+                {
+                    "repository0": {
+                        "__typename": "RepositoryConnection",
+                        "nodes": [
+                            self._repository(
+                                "example_repo", "healthy_loc", "some_job"
+                            )
+                        ],
+                    }
+                },
+            ]
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        result = list_jobs(repository_name="example_repo")
+
+        assert [job["job"] for job in result] == ["some_job"]
+        assert mock.call_count == 2
+
+    def test_discovered_selector_not_found_raises_even_without_load_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            side_effect=[
+                {
+                    "repositoriesOrError": self._connection(
+                        self._repository("example_repo", "here_loc")
+                    ),
+                    "workspaceOrError": self._workspace(
+                        self._loaded_entry("here_loc")
+                    ),
+                },
+                {
+                    "repository0": {
+                        "__typename": "RepositoryNotFoundError",
+                        "message": "Repository not found",
+                    }
+                },
+            ]
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            list_jobs(repository_name="example_repo")
+        message = str(exc_info.value)
+        assert "example_repo" in message
+        assert "here_loc" in message
+
+    @pytest.mark.parametrize(
+        "workspace_or_error",
+        [
+            pytest.param(None, id="non-mapping"),
+            pytest.param(
+                {"__typename": "PythonError", "message": "boom"}, id="python-error"
+            ),
+            pytest.param({"__typename": "Workspace"}, id="missing-location-entries"),
+        ],
+    )
+    def test_malformed_workspace_or_error_does_not_block_jobs(
+        self, monkeypatch: pytest.MonkeyPatch, workspace_or_error: object
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repository0": {
+                    "__typename": "RepositoryConnection",
+                    "nodes": [
+                        self._repository(
+                            "example_repo", "example_location", "selected_job"
+                        )
+                    ],
+                },
+                "workspaceOrError": workspace_or_error,
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        result = list_jobs(
+            repository_name="example_repo",
+            location_name="example_location",
+        )
+
+        assert [job["job"] for job in result] == ["selected_job"]
+
+    @pytest.mark.parametrize(
+        "entry, expected",
+        [
+            pytest.param("not a mapping", None, id="non-mapping-entry"),
+            pytest.param({"name": 123}, None, id="non-str-name"),
+            pytest.param(
+                _failed_entry("broken_loc", ""),
+                ("broken_loc", "Dagster did not provide an error message"),
+                id="python-error-without-message",
+            ),
+            pytest.param(
+                {
+                    "name": "odd_loc",
+                    "loadStatus": "LOADED",
+                    "locationOrLoadError": {"__typename": "FutureLocationVariant"},
+                },
+                None,
+                id="loaded-with-unknown-union-member",
+            ),
+            pytest.param(
+                {"name": "odd_loc", "loadStatus": None, "locationOrLoadError": None},
+                ("odd_loc", "code location is still loading (loadStatus=UNKNOWN)"),
+                id="unknown-load-status",
+            ),
+        ],
+    )
+    def test_location_unavailable_reason(
+        self, entry: object, expected: tuple[str, str] | None
+    ) -> None:
+        assert server._location_unavailable_reason(entry) == expected
+
+    def test_unfiltered_query_omits_workspace_load_status(self) -> None:
+        assert "workspaceOrError" not in server._LIST_JOBS_QUERY
+        assert "locationEntries" not in server._LIST_JOBS_QUERY
+        assert "loadStatus" not in server._LIST_JOBS_QUERY
+
+    def test_filtered_queries_include_workspace_load_status(self) -> None:
+        for query in (
+            server._LIST_JOB_REPOSITORIES_QUERY,
+            server._LIST_REPOSITORY_JOBS_QUERY,
+        ):
+            assert "workspaceOrError" in query
+            assert "locationEntries" in query
+            assert "loadStatus" in query
+
+    def test_fastmcp_publishes_exact_output_schema(self) -> None:
+        tools = asyncio.run(server.mcp.list_tools())
+        tool = next(tool for tool in tools if tool.name == "list_jobs")
+        result_schema = tool.output_schema["properties"]["result"]
+
+        assert result_schema["type"] == "array"
+        assert result_schema["items"]["properties"] == {
+            "repository": {"type": "string"},
+            "location": {"type": "string"},
+            "job": {"type": "string"},
+            "description": {"type": "string"},
+        }
+        assert result_schema["items"]["required"] == [
+            "repository",
+            "location",
+            "job",
+            "description",
+        ]
 
 
 class TestListSchedules:
