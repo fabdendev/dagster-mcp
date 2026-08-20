@@ -2,6 +2,7 @@ import json
 from unittest.mock import MagicMock
 
 import httpx
+import pytest
 
 from dagster_mcp.server import (
     get_runs, get_run_status, get_run_logs, get_run_stats, get_run_failure_summary,
@@ -249,6 +250,57 @@ class TestGetRunLogs:
         result = get_run_logs("r1", level_filter="WARNING")
         assert len(result["events"]) == 1
         assert result["events"][0]["level"] == "WARNING"
+
+    def test_level_filter_includes_higher_levels(self, mock_gql):
+        # Filtering at WARNING must not drop ERROR/CRITICAL: the docstring
+        # promises "this level or above", and an agent triaging an incident
+        # would otherwise be told there were no errors.
+        mock_gql({"data": {"logsForRun": {
+            "cursor": "c1", "hasMore": False,
+            "events": [
+                {"__typename": "RunStartEvent", "timestamp": "800",
+                 "message": "debug", "level": "DEBUG"},
+                {"__typename": "RunStartEvent", "timestamp": "900",
+                 "message": "start", "level": "INFO"},
+                {"__typename": "EngineEvent", "timestamp": "1000",
+                 "message": "warn", "level": "WARNING", "stepKey": None,
+                 "error": None},
+                {"__typename": "EngineEvent", "timestamp": "1100",
+                 "message": "boom", "level": "ERROR", "stepKey": None,
+                 "error": None},
+                {"__typename": "EngineEvent", "timestamp": "1200",
+                 "message": "fatal", "level": "CRITICAL", "stepKey": None,
+                 "error": None},
+            ],
+        }}})
+        result = get_run_logs("r1", level_filter="WARNING")
+        assert [e["level"] for e in result["events"]] == [
+            "WARNING", "ERROR", "CRITICAL",
+        ]
+
+    def test_level_filter_keeps_failure_events_below_error(self, mock_gql):
+        # A failure event whose own level is INFO must still surface when
+        # filtering at WARNING, not only at ERROR.
+        mock_gql({"data": {"logsForRun": {
+            "cursor": "c1", "hasMore": False,
+            "events": [
+                {"__typename": "ExecutionStepFailureEvent", "timestamp": "1000",
+                 "message": "step failed", "level": "INFO", "stepKey": "s",
+                 "error": {"message": "boom", "causes": []}},
+                {"__typename": "RunStartEvent", "timestamp": "900",
+                 "message": "start", "level": "INFO"},
+            ],
+        }}})
+        result = get_run_logs("r1", level_filter="WARNING")
+        assert [e["__typename"] for e in result["events"]] == [
+            "ExecutionStepFailureEvent",
+        ]
+
+    def test_level_filter_rejects_unknown_level(self, mock_gql):
+        mock_gql({"data": {"logsForRun": {"cursor": "c", "hasMore": False,
+                                          "events": []}}})
+        with pytest.raises(ValueError, match="level_filter must be one of"):
+            get_run_logs("r1", level_filter="LOUD")
 
 
 class TestGetRunStats:

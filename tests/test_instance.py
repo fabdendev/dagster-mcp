@@ -40,10 +40,13 @@ class TestListBackfills:
         assert payload["variables"]["limit"] == 5
 
 
-def _instance_response(daemons=None, queued_runs=None, locations=None):
+def _instance_response(daemons=None, queued_runs=None, locations=None, queued_count=None):
+    runs = {"results": queued_runs or []}
+    if queued_count is not None:
+        runs["count"] = queued_count
     return {"data": {
         "instance": {"daemonHealth": {"allDaemonStatuses": daemons or []}},
-        "runsOrError": {"results": queued_runs or []},
+        "runsOrError": runs,
         "workspaceOrError": {"locationEntries": locations or []},
     }}
 
@@ -67,6 +70,36 @@ class TestGetInstanceStatus:
         assert len(result["daemons"]) == 2
         assert result["queued_runs_count"] == 0
         assert result["code_location_errors"] == []
+
+    def test_queued_count_uses_server_total(self, mock_gql):
+        # The QUEUED probe is paged at 100. Reporting len(results) means any
+        # backlog >= 100 reads as exactly 100 — saturating precisely when the
+        # number matters. Runs.count is the real total for the filter.
+        mock_gql(_instance_response(
+            queued_runs=[{"runId": f"r{i}"} for i in range(100)],
+            queued_count=4237,
+        ))
+        result = get_instance_status()
+        assert result["queued_runs_count"] == 4237
+        assert result["queued_runs_count_capped"] is False
+
+    def test_queued_count_falls_back_and_flags_cap(self, mock_gql):
+        # Older Dagster leaves Runs.count nullable; fall back to the page
+        # length but say it is a floor rather than passing 100 off as exact.
+        mock_gql(_instance_response(
+            queued_runs=[{"runId": f"r{i}"} for i in range(100)],
+        ))
+        result = get_instance_status()
+        assert result["queued_runs_count"] == 100
+        assert result["queued_runs_count_capped"] is True
+
+    def test_queued_count_below_page_limit_is_not_capped(self, mock_gql):
+        mock_gql(_instance_response(
+            queued_runs=[{"runId": "r1"}, {"runId": "r2"}],
+        ))
+        result = get_instance_status()
+        assert result["queued_runs_count"] == 2
+        assert result["queued_runs_count_capped"] is False
 
     def test_unhealthy_daemon(self, mock_gql):
         mock_gql(_instance_response(

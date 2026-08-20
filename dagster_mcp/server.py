@@ -310,6 +310,19 @@ _METADATA_VALUE_FIELDS = {
 }
 
 
+# Dagster log levels, ordered. level_filter selects this level and above.
+# Page size for the QUEUED runs probe in get_instance_status.
+_QUEUED_RUNS_PAGE_LIMIT = 100
+
+_LOG_LEVEL_ORDER: dict[str, int] = {
+    "DEBUG": 0,
+    "INFO": 1,
+    "WARNING": 2,
+    "ERROR": 3,
+    "CRITICAL": 4,
+}
+
+
 def _flatten_metadata(entries: list[dict] | None) -> list[dict]:
     """Flatten raw metadataEntries into {label, description, value} dicts.
 
@@ -442,10 +455,11 @@ def get_run_logs(
 
     Parameters:
     - run_id: the run to fetch logs for
-    - level_filter: only return events at this level or above.
-      Values: 'DEBUG', 'INFO', 'WARNING', 'ERROR'. When set to 'ERROR',
-      also includes ExecutionStepFailureEvent and RunFailureEvent regardless
-      of their level field. Default: None (return all events).
+    - level_filter: only return events at this level or above, ordered
+      DEBUG < INFO < WARNING < ERROR < CRITICAL. Filtering at 'WARNING'
+      therefore also returns ERROR and CRITICAL events. ExecutionStepFailureEvent
+      and RunFailureEvent are always included when filtering at 'ERROR' or below,
+      regardless of their own level field. Default: None (return all events).
     - cursor: pagination cursor returned in previous response. Pass the
       cursor from the last call to get the next page.
     - limit: max events per page (default 100)
@@ -608,11 +622,20 @@ __METADATA_ENTRIES__
 
     if level_filter and "events" in result:
         upper = level_filter.upper()
+        threshold = _LOG_LEVEL_ORDER.get(upper)
+        if threshold is None:
+            raise ValueError(
+                f"level_filter must be one of {', '.join(_LOG_LEVEL_ORDER)}; got {level_filter!r}."
+            )
+        # Failure events are always surfaced when filtering at ERROR or below:
+        # some carry a level that would otherwise exclude them.
         error_types = ("ExecutionStepFailureEvent", "RunFailureEvent")
+        error_rank = _LOG_LEVEL_ORDER["ERROR"]
         result["events"] = [
             e
             for e in result["events"]
-            if e.get("level") == upper or (upper == "ERROR" and e.get("__typename") in error_types)
+            if _LOG_LEVEL_ORDER.get(e.get("level"), -1) >= threshold
+            or (threshold <= error_rank and e.get("__typename") in error_types)
         ]
 
     return result
@@ -2212,6 +2235,8 @@ def get_instance_status(env: str | None = None) -> dict:
     - daemons: list of {type, healthy, last_heartbeat, required} for each daemon
       (scheduler, sensor, run coordinator, etc.)
     - queued_runs_count: number of runs waiting in queue (high count = bottleneck)
+    - queued_runs_count_capped: true when the count is a floor rather than exact,
+      which happens only on Dagster versions that do not report a total
     - code_location_errors: list of {name, error} for locations that failed to load
 
     When to use: as the FIRST call in any diagnostic or monitoring flow.
@@ -2233,6 +2258,7 @@ def get_instance_status(env: str | None = None) -> dict:
       }
       runsOrError(filter: {statuses: [QUEUED]}, limit: 100) {
         ... on Runs {
+          count
           results { runId }
         }
         ... on PythonError { message }
@@ -2267,7 +2293,16 @@ def get_instance_status(env: str | None = None) -> dict:
     # Queued runs
     runs_or_error = data.get("runsOrError", {})
     queued_runs = runs_or_error.get("results", [])
-    queued_count = len(queued_runs)
+    # Runs.count is the true total for the filter. It is nullable on older
+    # Dagster, so fall back to the page length and flag that it is a floor
+    # rather than reporting a saturated 100 as if it were exact.
+    reported_count = runs_or_error.get("count")
+    if isinstance(reported_count, int):
+        queued_count = reported_count
+        queued_count_capped = False
+    else:
+        queued_count = len(queued_runs)
+        queued_count_capped = len(queued_runs) >= _QUEUED_RUNS_PAGE_LIMIT
 
     # Code location errors
     location_entries = data.get("workspaceOrError", {}).get("locationEntries", [])
@@ -2284,6 +2319,7 @@ def get_instance_status(env: str | None = None) -> dict:
         "healthy": healthy,
         "daemons": daemons,
         "queued_runs_count": queued_count,
+        "queued_runs_count_capped": queued_count_capped,
         "code_location_errors": code_location_errors,
     }
 
