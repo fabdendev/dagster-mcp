@@ -304,9 +304,25 @@ example, `list_jobs(repository_name="example_repository")` finds that repository
 across locations, while
 `list_jobs(repository_name="example_repository", location_name="example_location")`
 targets one repository and code-location pair. Calls with only one filter use a
-lightweight repository-discovery request followed by one batched job request.
-This extra round-trip substantially reduces payload size when only a subset of
-repositories matches.
+lightweight repository-discovery request followed by one batched job request —
+it isn't free: that's a second round-trip against Dagster, traded for a
+smaller payload when only a subset of repositories matches. Request counts
+per call: 1 for no filters, 1 for both filters, 2 for exactly one filter.
+
+If a code location relevant to the filter failed to load or is still loading,
+`list_jobs` raises a `RuntimeError` naming the location instead of silently
+returning an empty result — an empty filtered result means no match among
+code locations Dagster could actually load. A non-empty filtered result can
+still be incomplete: if some repositories matched, `list_jobs` returns them
+rather than raising, even when another code location could not be searched.
+This check rides along in the same requests above (`workspaceOrError`, which
+`list_code_locations` already queries), so it adds no extra round-trip. The
+unfiltered call
+(`list_jobs()` with no filters) is unchanged: it omits this check and keeps
+returning whatever is loaded, since an agent won't misread a long inventory
+listing as "nothing exists" the way it would misread an empty filtered
+result — use `list_code_locations` or `get_instance_status` to check load
+health directly.
 
 ### Instance & Code Locations
 
@@ -394,3 +410,4 @@ uv run python -m dagster_mcp      # start server locally
 ## License
 
 MIT
+
