@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from dagster_mcp import server
-from dagster_mcp.server import get_tick_history, list_jobs, list_schedules, list_sensors
+from dagster_mcp.server import list_jobs, list_schedules, list_sensors, get_tick_history
 
 
 class TestListJobs:
@@ -21,6 +21,30 @@ class TestListJobs:
     @staticmethod
     def _connection(*repositories: dict[str, object]) -> dict[str, object]:
         return {"__typename": "RepositoryConnection", "nodes": list(repositories)}
+
+    @staticmethod
+    def _workspace(*entries: dict[str, object]) -> dict[str, object]:
+        return {"__typename": "Workspace", "locationEntries": list(entries)}
+
+    @staticmethod
+    def _loaded_entry(name: str) -> dict[str, object]:
+        return {
+            "name": name,
+            "loadStatus": "LOADED",
+            "locationOrLoadError": {"__typename": "RepositoryLocation"},
+        }
+
+    @staticmethod
+    def _failed_entry(name: str, message: str) -> dict[str, object]:
+        return {
+            "name": name,
+            "loadStatus": "LOADED",
+            "locationOrLoadError": {"__typename": "PythonError", "message": message},
+        }
+
+    @staticmethod
+    def _loading_entry(name: str) -> dict[str, object]:
+        return {"name": name, "loadStatus": "LOADING", "locationOrLoadError": None}
 
     @staticmethod
     def _assert_union_fields(query: str) -> None:
@@ -344,6 +368,257 @@ class TestListJobs:
         mock_gql({"data": {"repositoriesOrError": self._connection(repository)}})
 
         assert list_jobs()[0]["description"] == ""
+
+    def test_both_filters_not_found_with_failed_location_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repository0": {
+                    "__typename": "RepositoryNotFoundError",
+                    "message": "Repository not found",
+                },
+                "workspaceOrError": self._workspace(
+                    self._failed_entry(
+                        "broken_loc", "ModuleNotFoundError: no module named 'foo'"
+                    )
+                ),
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            list_jobs(repository_name="example_repo", location_name="broken_loc")
+        message = str(exc_info.value)
+        assert "broken_loc" in message
+        assert "ModuleNotFoundError: no module named 'foo'" in message
+
+    def test_both_filters_not_found_with_all_locations_loaded_returns_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repository0": {
+                    "__typename": "RepositoryNotFoundError",
+                    "message": "Repository not found",
+                },
+                "workspaceOrError": self._workspace(
+                    self._loaded_entry("example_location")
+                ),
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        result = list_jobs(
+            repository_name="missing_repo", location_name="example_location"
+        )
+
+        assert result == []
+
+    def test_both_filters_not_found_with_loading_location_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repository0": {
+                    "__typename": "RepositoryNotFoundError",
+                    "message": "Repository not found",
+                },
+                "workspaceOrError": self._workspace(self._loading_entry("slow_loc")),
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            list_jobs(repository_name="example_repo", location_name="slow_loc")
+        message = str(exc_info.value)
+        assert "slow_loc" in message
+        assert "loading" in message.lower()
+
+    def test_location_only_unavailable_location_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repositoriesOrError": self._connection(),
+                "workspaceOrError": self._workspace(
+                    self._failed_entry("broken_loc", "ImportError: boom")
+                ),
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            list_jobs(location_name="broken_loc")
+        message = str(exc_info.value)
+        assert "broken_loc" in message
+        assert "ImportError: boom" in message
+        mock.assert_called_once()
+
+    def test_repository_only_no_matches_with_unavailable_location_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repositoriesOrError": self._connection(
+                    self._repository("other_repo", "healthy_loc")
+                ),
+                "workspaceOrError": self._workspace(
+                    self._loaded_entry("healthy_loc"),
+                    self._failed_entry("broken_loc", "ImportError: boom"),
+                ),
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            list_jobs(repository_name="missing_repo")
+        message = str(exc_info.value)
+        assert "broken_loc" in message
+        assert "ImportError: boom" in message
+        mock.assert_called_once()
+
+    def test_repository_only_with_matches_and_unrelated_unavailable_location_returns_jobs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            side_effect=[
+                {
+                    "repositoriesOrError": self._connection(
+                        self._repository("example_repo", "healthy_loc")
+                    ),
+                    "workspaceOrError": self._workspace(
+                        self._loaded_entry("healthy_loc"),
+                        self._failed_entry("broken_loc", "ImportError: boom"),
+                    ),
+                },
+                {
+                    "repository0": {
+                        "__typename": "RepositoryConnection",
+                        "nodes": [
+                            self._repository(
+                                "example_repo", "healthy_loc", "some_job"
+                            )
+                        ],
+                    }
+                },
+            ]
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        result = list_jobs(repository_name="example_repo")
+
+        assert [job["job"] for job in result] == ["some_job"]
+        assert mock.call_count == 2
+
+    def test_discovered_selector_not_found_raises_even_without_load_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock = MagicMock(
+            side_effect=[
+                {
+                    "repositoriesOrError": self._connection(
+                        self._repository("example_repo", "here_loc")
+                    ),
+                    "workspaceOrError": self._workspace(
+                        self._loaded_entry("here_loc")
+                    ),
+                },
+                {
+                    "repository0": {
+                        "__typename": "RepositoryNotFoundError",
+                        "message": "Repository not found",
+                    }
+                },
+            ]
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            list_jobs(repository_name="example_repo")
+        message = str(exc_info.value)
+        assert "example_repo" in message
+        assert "here_loc" in message
+
+    @pytest.mark.parametrize(
+        "workspace_or_error",
+        [
+            pytest.param(None, id="non-mapping"),
+            pytest.param(
+                {"__typename": "PythonError", "message": "boom"}, id="python-error"
+            ),
+            pytest.param({"__typename": "Workspace"}, id="missing-location-entries"),
+        ],
+    )
+    def test_malformed_workspace_or_error_does_not_block_jobs(
+        self, monkeypatch: pytest.MonkeyPatch, workspace_or_error: object
+    ) -> None:
+        mock = MagicMock(
+            return_value={
+                "repository0": {
+                    "__typename": "RepositoryConnection",
+                    "nodes": [
+                        self._repository(
+                            "example_repo", "example_location", "selected_job"
+                        )
+                    ],
+                },
+                "workspaceOrError": workspace_or_error,
+            }
+        )
+        monkeypatch.setattr(server, "gql", mock)
+
+        result = list_jobs(
+            repository_name="example_repo",
+            location_name="example_location",
+        )
+
+        assert [job["job"] for job in result] == ["selected_job"]
+
+    @pytest.mark.parametrize(
+        "entry, expected",
+        [
+            pytest.param("not a mapping", None, id="non-mapping-entry"),
+            pytest.param({"name": 123}, None, id="non-str-name"),
+            pytest.param(
+                _failed_entry("broken_loc", ""),
+                ("broken_loc", "Dagster did not provide an error message"),
+                id="python-error-without-message",
+            ),
+            pytest.param(
+                {
+                    "name": "odd_loc",
+                    "loadStatus": "LOADED",
+                    "locationOrLoadError": {"__typename": "FutureLocationVariant"},
+                },
+                None,
+                id="loaded-with-unknown-union-member",
+            ),
+            pytest.param(
+                {"name": "odd_loc", "loadStatus": None, "locationOrLoadError": None},
+                ("odd_loc", "code location is still loading (loadStatus=UNKNOWN)"),
+                id="unknown-load-status",
+            ),
+        ],
+    )
+    def test_location_unavailable_reason(
+        self, entry: object, expected: tuple[str, str] | None
+    ) -> None:
+        assert server._location_unavailable_reason(entry) == expected
+
+    def test_unfiltered_query_omits_workspace_load_status(self) -> None:
+        assert "workspaceOrError" not in server._LIST_JOBS_QUERY
+        assert "locationEntries" not in server._LIST_JOBS_QUERY
+        assert "loadStatus" not in server._LIST_JOBS_QUERY
+
+    def test_filtered_queries_include_workspace_load_status(self) -> None:
+        for query in (
+            server._LIST_JOB_REPOSITORIES_QUERY,
+            server._LIST_REPOSITORY_JOBS_QUERY,
+        ):
+            assert "workspaceOrError" in query
+            assert "locationEntries" in query
+            assert "loadStatus" in query
 
     def test_fastmcp_publishes_exact_output_schema(self) -> None:
         tools = asyncio.run(server.mcp.list_tools())
