@@ -1363,6 +1363,82 @@ def _unavailable_code_locations(data: Mapping[str, Any]) -> dict[str, str]:
     return unavailable
 
 
+def _workspace_location_entries(
+    response: object, context: str
+) -> list[Mapping[str, Any]]:
+    """Decode and validate a Dagster ``WorkspaceOrError`` union result."""
+    if not isinstance(response, Mapping):
+        raise RuntimeError(
+            f"Malformed Dagster workspaceOrError response while {context}: "
+            "expected a union result"
+        )
+
+    typename = response.get("__typename")
+    if typename == "Workspace":
+        entries = response.get("locationEntries")
+        if not isinstance(entries, list) or any(
+            not isinstance(entry, Mapping) for entry in entries
+        ):
+            raise RuntimeError(
+                f"Malformed Dagster Workspace while {context}: "
+                "expected locationEntries to be a list of code locations"
+            )
+        return entries
+
+    if typename == "PythonError":
+        message = response.get("message")
+        if not isinstance(message, str):
+            message = "No error message was provided"
+        raise RuntimeError(f"Dagster failed while {context}: {message}")
+
+    raise RuntimeError(
+        f"Unexpected Dagster workspaceOrError typename {typename!r} while {context}"
+    )
+
+
+def _raise_for_unavailable_code_locations(
+    data: Mapping[str, Any],
+    context: str,
+    *,
+    location_name: str | None = None,
+) -> None:
+    """Refuse a workspace search that could omit a relevant code location.
+
+    ``workspaceOrError`` is diagnostic data added as a sibling field to the
+    repository query. When present, its union and entries are decoded strictly.
+    When ``location_name`` is supplied, unrelated unavailable locations cannot
+    affect the targeted lookup and therefore do not block it.
+    """
+    if "workspaceOrError" not in data:
+        return
+
+    entries = _workspace_location_entries(data.get("workspaceOrError"), context)
+    unavailable = {}
+    for entry in entries:
+        resolved = _location_unavailable_reason(entry)
+        if resolved is not None:
+            name, reason = resolved
+            unavailable[name] = reason
+
+    if location_name is not None:
+        unavailable = {
+            name: reason
+            for name, reason in unavailable.items()
+            if name == location_name
+        }
+    if not unavailable:
+        return
+
+    locations = ", ".join(
+        f"{name!r} ({reason})" for name, reason in sorted(unavailable.items())
+    )
+    raise RuntimeError(
+        f"Dagster cannot safely complete {context} because the following code "
+        f"locations are unavailable: {locations}. Check list_code_locations "
+        "for details."
+    )
+
+
 def _repository_nodes(
     response: object,
     context: str,
@@ -1583,10 +1659,14 @@ def list_schedules(env: str | None = None) -> list[dict]:
     or find schedules that are stopped and might need attention.
     If a schedule is RUNNING but jobs aren't executing, use
     get_tick_history to inspect recent ticks for errors.
+    Raises when a code location is unavailable rather than returning a partial
+    list that could be mistaken for the complete set of schedules.
     """
-    query = """
+    query = (
+        """
     query ListSchedules {
       repositoriesOrError {
+        __typename
         ... on RepositoryConnection {
           nodes {
             name
@@ -1600,12 +1680,18 @@ def list_schedules(env: str | None = None) -> list[dict]:
             }
           }
         }
+        ... on RepositoryNotFoundError { message }
         ... on PythonError { message }
       }
+    """
+        + _WORKSPACE_LOAD_STATUS_SELECTION
+        + """
     }
     """
+    )
     data = gql(query, env=env)
-    repos = data.get("repositoriesOrError", {}).get("nodes", [])
+    repos = _repository_nodes(data.get("repositoriesOrError"), "listing schedules")
+    _raise_for_unavailable_code_locations(data, "listing schedules")
     result = []
     for repo in repos:
         for sched in repo.get("schedules", []):
@@ -1634,10 +1720,14 @@ def list_sensors(env: str | None = None) -> list[dict]:
     When to use: to check which sensors are active and what jobs they trigger.
     If a sensor is RUNNING but not producing runs, use get_tick_history to
     inspect recent ticks — it will show skipped ticks, errors, or runs launched.
+    Raises when a code location is unavailable rather than returning a partial
+    list that could be mistaken for the complete set of sensors.
     """
-    query = """
+    query = (
+        """
     query ListSensors {
       repositoriesOrError {
+        __typename
         ... on RepositoryConnection {
           nodes {
             name
@@ -1649,12 +1739,18 @@ def list_sensors(env: str | None = None) -> list[dict]:
             }
           }
         }
+        ... on RepositoryNotFoundError { message }
         ... on PythonError { message }
       }
+    """
+        + _WORKSPACE_LOAD_STATUS_SELECTION
+        + """
     }
     """
+    )
     data = gql(query, env=env)
-    repos = data.get("repositoriesOrError", {}).get("nodes", [])
+    repos = _repository_nodes(data.get("repositoriesOrError"), "listing sensors")
+    _raise_for_unavailable_code_locations(data, "listing sensors")
     result = []
     for repo in repos:
         for sensor in repo.get("sensors", []):
@@ -1702,9 +1798,11 @@ def _locate_instigators(
     """
     state_fields = " scheduleState { id selectorId }" if include_state else ""
     sensor_state_fields = " sensorState { id selectorId }" if include_state else ""
-    locate = """
+    locate = (
+        """
     query Locate {
       repositoriesOrError {
+        __typename
         ... on RepositoryConnection {
           nodes {
             name
@@ -1713,11 +1811,22 @@ def _locate_instigators(
             sensors { name%s }
           }
         }
+        ... on RepositoryNotFoundError { message }
         ... on PythonError { message }
       }
+    """
+        % (state_fields, sensor_state_fields)
+        + _WORKSPACE_LOAD_STATUS_SELECTION
+        + """
     }
-    """ % (state_fields, sensor_state_fields)
-    repos = gql(locate, env=env).get("repositoriesOrError", {}).get("nodes", [])
+    """
+    )
+    data = gql(locate, env=env)
+    context = f"locating {instigator_type.lower()} {instigator_name!r}"
+    repos = _repository_nodes(data.get("repositoriesOrError"), context)
+    _raise_for_unavailable_code_locations(
+        data, context, location_name=location_name
+    )
     field = "schedules" if instigator_type == "SCHEDULE" else "sensors"
     state_key = "scheduleState" if instigator_type == "SCHEDULE" else "sensorState"
     matches = []
@@ -2204,6 +2313,7 @@ def list_code_locations(env: str | None = None) -> list[dict]:
     query = """
     query CodeLocations {
       workspaceOrError {
+        __typename
         ... on Workspace {
           locationEntries {
             name
@@ -2217,12 +2327,14 @@ def list_code_locations(env: str | None = None) -> list[dict]:
             }
           }
         }
+        ... on PythonError { message }
       }
     }
     """
     data = gql(query, env=env)
-    workspace = data.get("workspaceOrError", {})
-    return workspace.get("locationEntries", [])
+    return _workspace_location_entries(
+        data.get("workspaceOrError"), "listing code locations"
+    )
 
 
 @mcp.tool()
