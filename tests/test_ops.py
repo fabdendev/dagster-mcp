@@ -642,7 +642,8 @@ class TestListJobs:
 
 class TestListSchedules:
     def test_schedules(self, mock_gql):
-        mock_gql({"data": {"repositoriesOrError": {"nodes": [
+        mock_gql({"data": {"repositoriesOrError": {
+            "__typename": "RepositoryConnection", "nodes": [
             {"name": "repo1", "location": {"name": "loc1"}, "schedules": [
                 {"name": "daily_sched", "cronSchedule": "0 0 * * *",
                  "scheduleState": {"status": "RUNNING"},
@@ -656,7 +657,8 @@ class TestListSchedules:
         assert result[0]["next_tick"] == "9999"
 
     def test_no_future_ticks(self, mock_gql):
-        mock_gql({"data": {"repositoriesOrError": {"nodes": [
+        mock_gql({"data": {"repositoriesOrError": {
+            "__typename": "RepositoryConnection", "nodes": [
             {"name": "r", "location": {"name": "l"}, "schedules": [
                 {"name": "s", "cronSchedule": "0 * * * *",
                  "scheduleState": {"status": "STOPPED"},
@@ -667,10 +669,27 @@ class TestListSchedules:
         result = list_schedules()
         assert result[0]["next_tick"] is None
 
+    def test_empty(self, mock_gql):
+        mock_gql({"data": {"repositoriesOrError": {
+            "__typename": "RepositoryConnection", "nodes": [],
+        }}})
+        assert list_schedules() == []
+
+    def test_python_error_raises(self, mock_gql):
+        mock_post = mock_gql({"data": {"repositoriesOrError": {
+            "__typename": "PythonError", "message": "schedule load failed",
+        }}})
+        with pytest.raises(RuntimeError, match="schedule load failed"):
+            list_schedules()
+        query = mock_post.call_args.kwargs["json"]["query"]
+        assert "__typename" in query
+        assert "workspaceOrError" in query
+
 
 class TestListSensors:
     def test_sensors(self, mock_gql):
-        mock_gql({"data": {"repositoriesOrError": {"nodes": [
+        mock_gql({"data": {"repositoriesOrError": {
+            "__typename": "RepositoryConnection", "nodes": [
             {"name": "repo1", "location": {"name": "loc1"}, "sensors": [
                 {"name": "my_sensor",
                  "sensorState": {"status": "RUNNING"},
@@ -682,8 +701,52 @@ class TestListSensors:
         assert result[0]["targets"] == ["job_a"]
 
     def test_empty(self, mock_gql):
-        mock_gql({"data": {"repositoriesOrError": {"nodes": []}}})
+        mock_gql({"data": {"repositoriesOrError": {
+            "__typename": "RepositoryConnection", "nodes": [],
+        }}})
         assert list_sensors() == []
+
+    def test_python_error_without_message_uses_fallback(self, mock_gql):
+        mock_post = mock_gql({"data": {"repositoriesOrError": {
+            "__typename": "PythonError",
+        }}})
+        with pytest.raises(RuntimeError, match="No error message was provided"):
+            list_sensors()
+        query = mock_post.call_args.kwargs["json"]["query"]
+        assert "__typename" in query
+        assert "workspaceOrError" in query
+
+    def test_failed_location_rejects_partial_results(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": {
+                "__typename": "RepositoryConnection", "nodes": [],
+            },
+            "workspaceOrError": {
+                "__typename": "Workspace",
+                "locationEntries": [{
+                    "name": "broken_loc",
+                    "loadStatus": "LOADED",
+                    "locationOrLoadError": {
+                        "__typename": "PythonError",
+                        "message": "ImportError: boom",
+                    },
+                }],
+            },
+        }})
+        with pytest.raises(RuntimeError, match="broken_loc.*ImportError: boom"):
+            list_sensors()
+
+    def test_workspace_python_error_raises(self, mock_gql):
+        mock_gql({"data": {
+            "repositoriesOrError": {
+                "__typename": "RepositoryConnection", "nodes": [],
+            },
+            "workspaceOrError": {
+                "__typename": "PythonError", "message": "workspace failed",
+            },
+        }})
+        with pytest.raises(RuntimeError, match="workspace failed"):
+            list_sensors()
 
 
 class TestGetTickHistory:
@@ -692,7 +755,7 @@ class TestGetTickHistory:
     # mock_gql reuses one response for both, so combine both keys in a single dict.
     @staticmethod
     def _locate(name, field):
-        return {"nodes": [
+        return {"__typename": "RepositoryConnection", "nodes": [
             {"name": "repo", "location": {"name": "loc"},
              "schedules": [{"name": name}] if field == "schedules" else [],
              "sensors": [{"name": name}] if field == "sensors" else []},
@@ -726,12 +789,27 @@ class TestGetTickHistory:
         assert result["ticks"][0]["error"] == "Connection refused"
 
     def test_not_found(self, mock_gql):
-        mock_gql({"data": {"repositoriesOrError": {"nodes": [
+        mock_gql({"data": {"repositoriesOrError": {
+            "__typename": "RepositoryConnection", "nodes": [
             {"name": "repo", "location": {"name": "loc"},
              "schedules": [], "sensors": [{"name": "other_sensor"}]},
         ]}}})
         result = get_tick_history("missing_sensor", "SENSOR")
         assert "not found" in result["message"]
+
+    @pytest.mark.parametrize("instigator_type", ["SCHEDULE", "SENSOR"])
+    def test_locate_python_error_stops_before_tick_query(
+        self, instigator_type, mock_gql
+    ):
+        mock_post = mock_gql({"data": {"repositoriesOrError": {
+            "__typename": "PythonError", "message": "workspace unavailable",
+        }}})
+        with pytest.raises(RuntimeError, match="workspace unavailable"):
+            get_tick_history("target", instigator_type)
+        mock_post.assert_called_once()
+        query = mock_post.call_args.kwargs["json"]["query"]
+        assert "__typename" in query
+        assert "workspaceOrError" in query
 
     def test_invalid_type(self, mock_gql):
         with pytest.raises(ValueError, match="must be 'SCHEDULE' or 'SENSOR'"):

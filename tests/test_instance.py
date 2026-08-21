@@ -1,9 +1,12 @@
-from dagster_mcp.server import list_code_locations, list_backfills, get_instance_status
+import pytest
+
+from dagster_mcp.server import get_instance_status, list_backfills, list_code_locations
 
 
 class TestListCodeLocations:
     def test_locations(self, mock_gql):
-        mock_gql({"data": {"workspaceOrError": {"locationEntries": [
+        mock_gql({"data": {"workspaceOrError": {
+            "__typename": "Workspace", "locationEntries": [
             {"name": "loc1", "loadStatus": "LOADED",
              "locationOrLoadError": {
                  "name": "loc1", "repositories": [{"name": "repo1"}]}},
@@ -13,8 +16,27 @@ class TestListCodeLocations:
         assert result[0]["name"] == "loc1"
 
     def test_empty(self, mock_gql):
-        mock_gql({"data": {"workspaceOrError": {"locationEntries": []}}})
+        mock_gql({"data": {"workspaceOrError": {
+            "__typename": "Workspace", "locationEntries": [],
+        }}})
         assert list_code_locations() == []
+
+    def test_python_error_raises(self, mock_gql):
+        mock_post = mock_gql({"data": {"workspaceOrError": {
+            "__typename": "PythonError", "message": "workspace load failed",
+        }}})
+        with pytest.raises(RuntimeError, match="workspace load failed"):
+            list_code_locations()
+        query = mock_post.call_args.kwargs["json"]["query"]
+        assert "__typename" in query
+        assert "... on PythonError { message }" in query
+
+    def test_python_error_without_message_uses_fallback(self, mock_gql):
+        mock_gql({"data": {"workspaceOrError": {
+            "__typename": "PythonError",
+        }}})
+        with pytest.raises(RuntimeError, match="No error message was provided"):
+            list_code_locations()
 
 
 class TestListBackfills:

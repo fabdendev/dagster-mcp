@@ -777,7 +777,7 @@ def _locate_payload(name, field, sid="orig::sel", selector_id="sel", status="RUN
         if sid is not None or selector_id is not None
         else None
     )
-    return {"nodes": [{
+    return {"__typename": "RepositoryConnection", "nodes": [{
         "name": "repo",
         "location": {"name": "loc"},
         "schedules": (
@@ -790,7 +790,7 @@ def _locate_payload(name, field, sid="orig::sel", selector_id="sel", status="RUN
 
 
 def _empty_locate():
-    return {"nodes": [{
+    return {"__typename": "RepositoryConnection", "nodes": [{
         "name": "repo", "location": {"name": "loc"},
         "schedules": [], "sensors": [],
     }]}
@@ -829,6 +829,14 @@ class TestStartSchedule:
         result = start_schedule("daily")
         assert "not found" in result["message"]
         assert "status" not in result
+
+    def test_locate_python_error_does_not_mutate(self, mock_gql):
+        mock_post = mock_gql({"data": {"repositoriesOrError": {
+            "__typename": "PythonError", "message": "location failed",
+        }}})
+        with pytest.raises(RuntimeError, match="location failed"):
+            start_schedule("daily")
+        mock_post.assert_called_once()
 
     def test_unauthorized(self, mock_gql):
         mock_gql({"data": {
@@ -1057,7 +1065,10 @@ def _multi_locate(name, field):
             ),
         }
 
-    return {"nodes": [node("repo_a", "loc_a"), node("repo_b", "loc_b")]}
+    return {
+        "__typename": "RepositoryConnection",
+        "nodes": [node("repo_a", "loc_a"), node("repo_b", "loc_b")],
+    }
 
 
 class TestInstigatorDisambiguation:
@@ -1121,6 +1132,42 @@ class TestInstigatorDisambiguation:
         mock_gql({"data": {"repositoriesOrError": _multi_locate("s", "sensors")}})
         result = start_sensor("s", repository_name="nope")
         assert "not found" in result["message"]
+
+    def test_unavailable_location_prevents_selecting_apparently_unique_match(
+        self, mock_gql
+    ):
+        mock_post = mock_gql({"data": {
+            "repositoriesOrError": _locate_payload("daily", "schedules"),
+            "workspaceOrError": {
+                "__typename": "Workspace",
+                "locationEntries": [
+                    {
+                        "name": "loc",
+                        "loadStatus": "LOADED",
+                        "locationOrLoadError": {
+                            "__typename": "RepositoryLocation",
+                        },
+                    },
+                    {
+                        "name": "broken_loc",
+                        "loadStatus": "LOADED",
+                        "locationOrLoadError": {
+                            "__typename": "PythonError",
+                            "message": "ImportError: boom",
+                        },
+                    },
+                ],
+            },
+        }})
+        with pytest.raises(RuntimeError, match="broken_loc.*ImportError: boom") as exc_info:
+            start_schedule("daily")
+        message = str(exc_info.value)
+        assert "location_name" in message
+        assert "repository_name" in message
+        mock_post.assert_called_once()
+        query = mock_post.call_args.kwargs["json"]["query"]
+        assert "__typename" in query
+        assert "workspaceOrError" in query
 
     @pytest.mark.parametrize(
         "fn,name,field",
