@@ -1365,7 +1365,7 @@ def _unavailable_code_locations(data: Mapping[str, Any]) -> dict[str, str]:
 
 def _workspace_location_entries(
     response: object, context: str
-) -> list[Mapping[str, Any]]:
+) -> list[dict[str, Any]]:
     """Decode and validate a Dagster ``WorkspaceOrError`` union result."""
     if not isinstance(response, Mapping):
         raise RuntimeError(
@@ -1377,7 +1377,7 @@ def _workspace_location_entries(
     if typename == "Workspace":
         entries = response.get("locationEntries")
         if not isinstance(entries, list) or any(
-            not isinstance(entry, Mapping) for entry in entries
+            not isinstance(entry, dict) for entry in entries
         ):
             raise RuntimeError(
                 f"Malformed Dagster Workspace while {context}: "
@@ -1434,8 +1434,9 @@ def _raise_for_unavailable_code_locations(
     )
     raise RuntimeError(
         f"Dagster cannot safely complete {context} because the following code "
-        f"locations are unavailable: {locations}. Check list_code_locations "
-        "for details."
+        f"locations are unavailable: {locations}. Pass location_name to target "
+        "a specific code location (and repository_name if needed), or check "
+        "list_code_locations for details."
     )
 
 
@@ -1444,7 +1445,7 @@ def _repository_nodes(
     context: str,
     *,
     not_found_message: str | None = None,
-) -> list[Mapping[str, Any]]:
+) -> list[dict[str, Any]]:
     """Decode and validate a Dagster ``RepositoriesOrError`` union result.
 
     ``not_found_message``, when given, is raised instead of the default
@@ -1462,7 +1463,7 @@ def _repository_nodes(
     if typename == "RepositoryConnection":
         nodes = response.get("nodes")
         if not isinstance(nodes, list) or any(
-            not isinstance(node, Mapping) for node in nodes
+            not isinstance(node, dict) for node in nodes
         ):
             raise RuntimeError(
                 f"Malformed Dagster RepositoryConnection while {context}: "
@@ -2082,7 +2083,9 @@ def stop_schedule(
 
     - schedule_name: exact schedule name (from list_schedules)
     - repository_name / location_name: optional, to disambiguate when the same
-      schedule name exists in several code locations
+      schedule name exists in several code locations. Pass location_name (and
+      repository_name if needed) to target a healthy location when another
+      code location is unavailable
     - env: optional environment key; defaults to the configured instance
 
     Returns {name, instigator_type, repository, location, status} on success
@@ -2229,7 +2232,9 @@ def stop_sensor(
 
     - sensor_name: sensor name (from list_sensors or get_tick_history)
     - repository_name / location_name: optional, to disambiguate when the same
-      sensor name exists in several code locations
+      sensor name exists in several code locations. Pass location_name (and
+      repository_name if needed) to target a healthy location when another
+      code location is unavailable
     - env: optional environment key; defaults to the configured instance
 
     Returns {name, instigator_type, repository, location, status} on success

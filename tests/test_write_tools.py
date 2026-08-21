@@ -1159,8 +1159,11 @@ class TestInstigatorDisambiguation:
                 ],
             },
         }})
-        with pytest.raises(RuntimeError, match="broken_loc.*ImportError: boom"):
+        with pytest.raises(RuntimeError, match="broken_loc.*ImportError: boom") as exc_info:
             start_schedule("daily")
+        message = str(exc_info.value)
+        assert "location_name" in message
+        assert "repository_name" in message
         mock_post.assert_called_once()
         query = mock_post.call_args.kwargs["json"]["query"]
         assert "__typename" in query
