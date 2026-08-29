@@ -124,7 +124,8 @@ class TestMaterializeAssets:
                     {
                         "data": {
                             "launchRun": {
-                                "run": {"runId": "run1", "status": "STARTING"}
+                                "__typename": "LaunchRunSuccess",
+                                "run": {"runId": "run1", "status": "STARTING"},
                             }
                         }
                     }
@@ -174,7 +175,8 @@ class TestMaterializeAssets:
                     {
                         "data": {
                             "launchRun": {
-                                "run": {"runId": "run2", "status": "STARTING"}
+                                "__typename": "LaunchRunSuccess",
+"run": {"runId": "run2", "status": "STARTING"}
                             }
                         }
                     }
@@ -210,7 +212,8 @@ class TestMaterializeAssets:
                     {
                         "data": {
                             "launchRun": {
-                                "run": {"runId": "run-closure", "status": "STARTING"}
+                                "__typename": "LaunchRunSuccess",
+"run": {"runId": "run-closure", "status": "STARTING"}
                             }
                         }
                     }
@@ -351,7 +354,8 @@ class TestMaterializeAssets:
                     {
                         "data": {
                             "launchRun": {
-                                "run": {"runId": "run3", "status": "STARTING"}
+                                "__typename": "LaunchRunSuccess",
+"run": {"runId": "run3", "status": "STARTING"}
                             }
                         }
                     }
@@ -475,14 +479,14 @@ class TestAssetToolCompatibility:
 class TestLaunchJob:
     def test_launch_simple(self, mock_gql):
         mock_gql({"data": {"launchRun": {
-            "run": {"runId": "r_new", "status": "STARTING"},
+            "__typename": "LaunchRunSuccess", "run": {"runId": "r_new", "status": "STARTING"},
         }}})
         result = launch_job("my_job", "loc1", "repo1")
         assert result["run"]["runId"] == "r_new"
 
     def test_launch_with_assets(self, mock_gql):
         mock_post = mock_gql({"data": {"launchRun": {
-            "run": {"runId": "r2", "status": "STARTING"},
+            "__typename": "LaunchRunSuccess", "run": {"runId": "r2", "status": "STARTING"},
         }}})
         launch_job("__ASSET_JOB", "loc1", "repo1",
                     asset_keys=["asset_a", "asset_b"])
@@ -495,7 +499,7 @@ class TestLaunchJob:
 
     def test_launch_with_tags(self, mock_gql):
         mock_post = mock_gql({"data": {"launchRun": {
-            "run": {"runId": "r3", "status": "STARTING"},
+            "__typename": "LaunchRunSuccess", "run": {"runId": "r3", "status": "STARTING"},
         }}})
         launch_job("my_job", "loc1", "repo1", tags={"env": "prod"})
         payload = mock_post.call_args.kwargs["json"]
@@ -504,7 +508,7 @@ class TestLaunchJob:
 
     def test_launch_with_run_config(self, mock_gql):
         mock_post = mock_gql({"data": {"launchRun": {
-            "run": {"runId": "r4", "status": "STARTING"},
+            "__typename": "LaunchRunSuccess", "run": {"runId": "r4", "status": "STARTING"},
         }}})
         config = {"ops": {"my_op": {"config": {"start_date": "2026-03-01"}}}}
         launch_job("my_job", "loc1", "repo1", run_config=config)
@@ -513,21 +517,91 @@ class TestLaunchJob:
 
     def test_launch_without_run_config_sends_empty(self, mock_gql):
         mock_post = mock_gql({"data": {"launchRun": {
-            "run": {"runId": "r5", "status": "STARTING"},
+            "__typename": "LaunchRunSuccess", "run": {"runId": "r5", "status": "STARTING"},
         }}})
         launch_job("my_job", "loc1", "repo1")
         payload = mock_post.call_args.kwargs["json"]
         assert payload["variables"]["runConfigData"] == {}
 
 
+class TestLaunchResultIsDecodedStrictly:
+    """A launch mutation returns a union. A failure such as
+    ``PipelineNotFoundError`` is a *successful* GraphQL response, so a selection
+    set that omits that member decodes to ``{}`` and the caller reports a launch
+    that never happened.
+
+    Seen in production: ``launch_job`` with the default
+    ``repository_name='__repository__'`` against a code location whose real
+    repository is named something else returned ``{}``, and the operator read
+    that as a launched run.
+    """
+
+    def test_pipeline_not_found_raises_instead_of_returning_empty(self, mock_gql):
+        mock_gql({"data": {"launchRun": {
+            "__typename": "PipelineNotFoundError",
+            "message": "Could not find job my_job in repository __repository__",
+        }}})
+        with pytest.raises(RuntimeError, match="Could not find job"):
+            launch_job("my_job", "loc1", "__repository__")
+
+    def test_selection_asks_for_the_error_members(self, mock_gql):
+        mock_post = mock_gql({"data": {"launchRun": {
+            "__typename": "LaunchRunSuccess",
+            "run": {"runId": "r", "status": "STARTING"},
+        }}})
+        launch_job("my_job", "loc1", "repo1")
+        query = mock_post.call_args.kwargs["json"]["query"]
+        assert "__typename" in query
+        assert "... on PipelineNotFoundError { message }" in query
+
+    def test_unmatched_union_member_raises_with_selector_guidance(self, mock_gql):
+        # No __typename at all: exactly what the old selection produced.
+        mock_gql({"data": {"launchRun": {}}})
+        with pytest.raises(RuntimeError, match="repository_name"):
+            launch_job("my_job", "loc1", "__repository__")
+
+    def test_missing_payload_raises(self, mock_gql):
+        mock_gql({"data": {}})
+        with pytest.raises(RuntimeError, match="no launchRun payload"):
+            launch_job("my_job", "loc1", "repo1")
+
+    def test_error_without_message_uses_fallback(self, mock_gql):
+        mock_gql({"data": {"launchRun": {"__typename": "UnauthorizedError"}}})
+        with pytest.raises(RuntimeError, match="No error message was provided"):
+            launch_job("my_job", "loc1", "repo1")
+
+    def test_run_config_validation_errors_are_joined(self, mock_gql):
+        mock_gql({"data": {"launchRun": {
+            "__typename": "RunConfigValidationInvalid",
+            "errors": [{"message": "bad field a"}, {"message": "bad field b"}],
+        }}})
+        with pytest.raises(RuntimeError, match="bad field a; bad field b"):
+            launch_job("my_job", "loc1", "repo1")
+
+    def test_backfill_not_found_raises(self, mock_gql):
+        mock_gql({"data": {"launchPartitionBackfill": {
+            "__typename": "PartitionSetNotFoundError",
+            "message": "no such partition set",
+        }}})
+        with pytest.raises(RuntimeError, match="no such partition set"):
+            launch_job_with_partitions("daily_job", "loc1", ["2024-01-01"])
+
+    def test_success_still_returns_the_payload(self, mock_gql):
+        mock_gql({"data": {"launchRun": {
+            "__typename": "LaunchRunSuccess",
+            "run": {"runId": "r_ok", "status": "STARTING"},
+        }}})
+        assert launch_job("my_job", "loc1", "repo1")["run"]["runId"] == "r_ok"
+
+
 class TestLaunchJobWithPartitions:
     def test_single_partition(self, mock_gql):
-        mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}})
+        mock_gql({"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf1"}}})
         result = launch_job_with_partitions("daily_job", "loc1", ["2024-01-01"])
         assert result["backfillId"] == "bf1"
 
     def test_multiple_partitions(self, mock_gql):
-        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf2"}}})
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf2"}}})
         launch_job_with_partitions("daily_job", "loc1", ["2024-01-01", "2024-01-02"])
         payload = mock_post.call_args.kwargs["json"]
         assert payload["variables"]["backfillParams"]["partitionNames"] == [
@@ -535,14 +609,14 @@ class TestLaunchJobWithPartitions:
         ]
 
     def test_default_partition_set_name(self, mock_gql):
-        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf3"}}})
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf3"}}})
         launch_job_with_partitions("daily_job", "loc1", ["2024-01-01"])
         payload = mock_post.call_args.kwargs["json"]
         selector = payload["variables"]["backfillParams"]["selector"]
         assert selector["partitionSetName"] == "daily_job_partition_set"
 
     def test_custom_partition_set_name(self, mock_gql):
-        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf4"}}})
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf4"}}})
         launch_job_with_partitions(
             "daily_job", "loc1", ["2024-01-01"],
             partition_set_name="custom_partition_set",
@@ -552,7 +626,7 @@ class TestLaunchJobWithPartitions:
         assert selector["partitionSetName"] == "custom_partition_set"
 
     def test_repository_selector(self, mock_gql):
-        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf5"}}})
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf5"}}})
         launch_job_with_partitions(
             "daily_job", "my_location", ["2024-01-01"],
             repository_name="my_repo",
@@ -563,7 +637,7 @@ class TestLaunchJobWithPartitions:
         assert repo_selector["repositoryName"] == "my_repo"
 
     def test_with_tags(self, mock_gql):
-        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf6"}}})
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf6"}}})
         launch_job_with_partitions(
             "daily_job", "loc1", ["2024-01-01"],
             tags={"triggered_by": "agent"},
@@ -574,7 +648,7 @@ class TestLaunchJobWithPartitions:
         ]
 
     def test_from_failure(self, mock_gql):
-        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf7"}}})
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf7"}}})
         launch_job_with_partitions(
             "daily_job", "loc1", ["2024-01-01"],
             from_failure=True,
@@ -583,11 +657,14 @@ class TestLaunchJobWithPartitions:
         assert payload["variables"]["backfillParams"]["fromFailure"] is True
 
     def test_partition_set_not_found(self, mock_gql):
+        # Behavior change: a backfill that did not launch raises rather than
+        # returning a dict the caller can mistake for a launched backfill.
         mock_gql({"data": {"launchPartitionBackfill": {
-            "message": "Partition set not found"
+            "__typename": "PartitionSetNotFoundError",
+            "message": "Partition set not found",
         }}})
-        result = launch_job_with_partitions("bad_job", "loc1", ["2024-01-01"])
-        assert "message" in result
+        with pytest.raises(RuntimeError, match="Partition set not found"):
+            launch_job_with_partitions("bad_job", "loc1", ["2024-01-01"])
 
 
 class TestBackfillAssets:
@@ -609,7 +686,7 @@ class TestBackfillAssets:
                 _mock_response(
                     {
                         "data": {
-                            "launchPartitionBackfill": {"backfillId": "configured"}
+                            "launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "configured"}
                         }
                     }
                 ),
@@ -653,7 +730,7 @@ class TestBackfillAssets:
         assert mock_post.call_count == 1
 
     def test_explicit_partition_keys_skip_resolution(self, mock_gql):
-        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}})
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf1"}}})
         result = backfill_assets(["asset_a"], partition_keys=["2026-07-01", "2026-07-02"])
         assert result["backfillId"] == "bf1"
         payload = mock_post.call_args.kwargs["json"]
@@ -671,7 +748,7 @@ class TestBackfillAssets:
 
         backfill_resp = MagicMock()
         backfill_resp.status_code = 200
-        backfill_resp.json.return_value = {"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}}
+        backfill_resp.json.return_value = {"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf1"}}}
         backfill_resp.text = json.dumps(backfill_resp.json.return_value)
 
         mock_post = MagicMock(side_effect=[keys_resp, backfill_resp])
@@ -693,7 +770,7 @@ class TestBackfillAssets:
 
         backfill_resp = MagicMock()
         backfill_resp.status_code = 200
-        backfill_resp.json.return_value = {"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}}
+        backfill_resp.json.return_value = {"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf1"}}}
         backfill_resp.text = json.dumps(backfill_resp.json.return_value)
 
         mock_post = MagicMock(side_effect=[keys_resp, backfill_resp])
@@ -731,7 +808,7 @@ class TestBackfillAssets:
         assert "materialize_assets" in result["message"]
 
     def test_multi_asset_selection_and_tags(self, mock_gql):
-        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf2"}}})
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf2"}}})
         backfill_assets(
             ["asset_a", "asset_b"],
             partition_keys=["p1"],
@@ -743,7 +820,7 @@ class TestBackfillAssets:
         assert params["tags"] == [{"key": "triggered_by", "value": "agent"}]
 
     def test_multi_segment_asset_keys_split_into_path(self, mock_gql):
-        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}})
+        mock_post = mock_gql({"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf1"}}})
         backfill_assets(["raw_chargebee_dlt/customer"], partition_keys=["p1"])
         payload = mock_post.call_args.kwargs["json"]
         params = payload["variables"]["backfillParams"]
@@ -757,7 +834,7 @@ class TestBackfillAssets:
 
         backfill_resp = MagicMock()
         backfill_resp.status_code = 200
-        backfill_resp.json.return_value = {"data": {"launchPartitionBackfill": {"backfillId": "bf1"}}}
+        backfill_resp.json.return_value = {"data": {"launchPartitionBackfill": {"__typename": "LaunchBackfillSuccess", "backfillId": "bf1"}}}
         backfill_resp.text = json.dumps(backfill_resp.json.return_value)
 
         mock_post = MagicMock(side_effect=[keys_resp, backfill_resp])
