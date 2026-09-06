@@ -1396,6 +1396,54 @@ def _workspace_location_entries(
     )
 
 
+def _unwrap_launch_result(
+    data: Mapping[str, Any], field: str, context: str
+) -> dict[str, Any]:
+    """Decode a launch mutation union, raising on anything but success.
+
+    Dagster answers a launch mutation with a union. A failure such as
+    ``PipelineNotFoundError`` is a *successful* GraphQL response — ``gql`` sees
+    no ``errors`` key and returns normally — so a selection set that omits that
+    member decodes to ``{}`` and the caller reports a launch that never
+    happened. Decode strictly instead: anything that is not a
+    ``LaunchRunSuccess``/``LaunchBackfillSuccess`` raises with Dagster's own
+    message.
+    """
+    response = data.get(field)
+    if not isinstance(response, Mapping):
+        raise RuntimeError(
+            f"Dagster returned no {field} payload while {context}. "
+            "The job, repository, or code location name is probably wrong."
+        )
+
+    typename = response.get("__typename")
+    if typename in ("LaunchRunSuccess", "LaunchBackfillSuccess"):
+        return dict(response)
+
+    if typename == "RunConfigValidationInvalid":
+        errors = response.get("errors")
+        details = "; ".join(
+            e.get("message", str(e)) for e in errors if isinstance(e, Mapping)
+        ) if isinstance(errors, list) else ""
+        raise RuntimeError(
+            f"Dagster rejected the run config while {context}: "
+            f"{details or 'No error message was provided'}"
+        )
+
+    if typename is None:
+        raise RuntimeError(
+            f"Dagster returned an unrecognized {field} result while {context}. "
+            "This usually means the selector matched no job — check "
+            "repository_name (it is NOT always '__repository__'), "
+            "repository_location, and job_name against list_jobs."
+        )
+
+    message = response.get("message")
+    if not isinstance(message, str):
+        message = "No error message was provided"
+    raise RuntimeError(f"Dagster failed while {context} ({typename}): {message}")
+
+
 def _raise_for_unavailable_code_locations(
     data: Mapping[str, Any],
     context: str,
@@ -2882,8 +2930,10 @@ def launch_job(
     Required parameters:
     - job_name: name of the job (from list_jobs, e.g. 'my_etl_job')
     - repository_location: code location name (from list_jobs, e.g. 'my_project')
-    - repository_name: defaults to '__repository__', override if you have
-      multiple repositories in a single code location
+    - repository_name: defaults to '__repository__', which is correct only for
+      a code location that did not name its repository. Pass the real name if
+      list_jobs shows one (e.g. 'misc_repo'); a wrong value raises
+      PipelineNotFoundError rather than launching anything.
 
     Optional parameters:
     - asset_keys: list of asset key strings to materialize. Use this with the
@@ -2932,8 +2982,12 @@ def launch_job(
         runConfigData: $runConfigData,
         executionMetadata: $executionMetadata
       }) {
+        __typename
         ... on LaunchRunSuccess { run { runId status } }
         ... on InvalidSubsetError { message }
+        ... on PipelineNotFoundError { message }
+        ... on InvalidStepError { message }
+        ... on UnauthorizedError { message }
         ... on PythonError { message }
         ... on PresetNotFoundError { message }
         ... on ConflictingExecutionParamsError { message }
@@ -2950,7 +3004,9 @@ def launch_job(
         "executionMetadata": execution_metadata or None,
     }
     data = gql(query, variables, env=env)
-    return data.get("launchRun", {})
+    return _unwrap_launch_result(
+        data, "launchRun", f"launching job {job_name!r}"
+    )
 
 
 def launch_job_with_partitions(
@@ -2975,8 +3031,10 @@ def launch_job_with_partitions(
       Examples: ['2024-01-01'], ['2024-01-01', '2024-01-02', '2024-01-03']
 
     Optional parameters:
-    - repository_name: defaults to '__repository__', override if you have
-      multiple repositories in a single code location
+    - repository_name: defaults to '__repository__', which is correct only for
+      a code location that did not name its repository. Pass the real name if
+      list_jobs shows one (e.g. 'misc_repo'); a wrong value raises
+      PipelineNotFoundError rather than launching anything.
     - partition_set_name: partition set name; defaults to '{job_name}_partition_set'.
       Override this if the job uses a non-standard partition set name.
     - tags: additional key-value tags to attach to the launched runs.
@@ -2999,6 +3057,7 @@ def launch_job_with_partitions(
     query = """
     mutation LaunchPartitionBackfill($backfillParams: LaunchBackfillParams!) {
       launchPartitionBackfill(backfillParams: $backfillParams) {
+        __typename
         ... on LaunchBackfillSuccess { backfillId }
         ... on PartitionSetNotFoundError { message }
         ... on PipelineNotFoundError { message }
@@ -3023,7 +3082,9 @@ def launch_job_with_partitions(
         }
     }
     data = gql(query, variables, env=env)
-    return data.get("launchPartitionBackfill", {})
+    return _unwrap_launch_result(
+        data, "launchPartitionBackfill", f"backfilling job {job_name!r}"
+    )
 
 
 # ``run_config`` follows ``env`` to preserve the existing positional call signature.
@@ -3143,6 +3204,7 @@ def backfill_assets(
     query = """
     mutation LaunchAssetBackfill($backfillParams: LaunchBackfillParams!) {
       launchPartitionBackfill(backfillParams: $backfillParams) {
+        __typename
         ... on LaunchBackfillSuccess { backfillId }
         ... on PartitionSetNotFoundError { message }
         ... on PipelineNotFoundError { message }
@@ -3162,7 +3224,9 @@ def backfill_assets(
         backfill_params["runConfigData"] = run_config
     variables = {"backfillParams": backfill_params}
     data = gql(query, variables, env=env)
-    return data.get("launchPartitionBackfill", {})
+    return _unwrap_launch_result(
+        data, "launchPartitionBackfill", f"backfilling assets {asset_keys!r}"
+    )
 
 
 # ── Write tools (only registered when DAGSTER_READ_ONLY=false) ────────────────
