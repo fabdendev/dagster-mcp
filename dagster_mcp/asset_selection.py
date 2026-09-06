@@ -7,9 +7,8 @@ are evaluated against AssetNode dictionaries returned by Dagster GraphQL.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
-from typing import TypeAlias
+from dataclasses import dataclass
 
 
 class AssetSelectionSyntaxError(ValueError):
@@ -32,30 +31,30 @@ class _Predicate:
 
 @dataclass(frozen=True)
 class _Not:
-    child: "_Expression"
+    child: _Expression
 
 
 @dataclass(frozen=True)
 class _Binary:
     operator: str
-    left: "_Expression"
-    right: "_Expression"
+    left: _Expression
+    right: _Expression
 
 
 @dataclass(frozen=True)
 class _Function:
     name: str
-    child: "_Expression"
+    child: _Expression
 
 
 @dataclass(frozen=True)
 class _Traversal:
-    child: "_Expression"
+    child: _Expression
     upstream_depth: int | None = None
     downstream_depth: int | None = None
 
 
-_Expression: TypeAlias = _Predicate | _Not | _Binary | _Function | _Traversal
+type _Expression = _Predicate | _Not | _Binary | _Function | _Traversal
 
 _SUPPORTED_ATTRIBUTES = {"key", "group", "tag", "kind", "owner"}
 # ``None`` means no traversal on that side, so use a sentinel for unlimited depth.
@@ -359,9 +358,10 @@ class _GraphEvaluator:
                     or predicate.value in owners
                 ):
                     selected.add(key)
-            elif predicate.field == "tag":
-                if self._tag_matches(node, predicate.value, predicate.tag_value):
-                    selected.add(key)
+            elif predicate.field == "tag" and self._tag_matches(
+                node, predicate.value, predicate.tag_value
+            ):
+                selected.add(key)
         return selected
 
     @staticmethod

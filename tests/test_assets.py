@@ -3,7 +3,12 @@ from unittest.mock import MagicMock
 
 import httpx
 
-from dagster_mcp.server import search_assets, get_asset_details, get_recent_materializations, get_asset_health
+from dagster_mcp.server import (
+    get_asset_details,
+    get_asset_health,
+    get_recent_materializations,
+    search_assets,
+)
 
 
 class TestSearchAssets:

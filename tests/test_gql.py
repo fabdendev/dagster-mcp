@@ -1,7 +1,7 @@
-import pytest
 from unittest.mock import MagicMock
 
 import httpx
+import pytest
 
 from dagster_mcp.server import gql
 
