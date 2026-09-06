@@ -1,14 +1,13 @@
 """Tests for multi-environment support (DAGSTER_ENVS)."""
 
 import json
-import pytest
 from unittest.mock import MagicMock
 
 import httpx
+import pytest
 
 from dagster_mcp import server
-from dagster_mcp.server import gql, get_runs, list_jobs, get_instance_status
-
+from dagster_mcp.server import get_instance_status, get_runs, gql, list_jobs
 
 _TWO_ENVS = json.dumps({
     "prod": {"url": "https://prod.dagster.io", "token": "prod-token"},

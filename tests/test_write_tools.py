@@ -1450,7 +1450,8 @@ class TestStopWhenAlreadyStopped:
 class TestReadOnlyGating:
     def test_write_tools_not_registered_in_readonly(self):
         import asyncio
-        from dagster_mcp.server import mcp, READ_ONLY
+
+        from dagster_mcp.server import READ_ONLY, mcp
 
         tools = asyncio.run(mcp.list_tools())
         tool_names = [t.name for t in tools]

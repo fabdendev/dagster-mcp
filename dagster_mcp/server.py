@@ -3,7 +3,8 @@
 import bisect
 import json
 import os
-from typing import Any, Final, Mapping, Sequence, TypedDict
+from collections.abc import Mapping, Sequence
+from typing import Any, Final, TypedDict
 
 import httpx
 from fastmcp import FastMCP
@@ -145,7 +146,7 @@ def _get_runs_filter_job_field(env: str | None = None) -> str:
 
     try:
         fields = _get_type_fields("RunsFilter", env=env, input_type=True)
-    except Exception:
+    except Exception:  # noqa: BLE001 - any introspection failure means "fall back"
         # Job filtering predates introspection support and historically used
         # jobName, so preserve that fallback without caching a transient failure.
         return "jobName"
@@ -261,15 +262,17 @@ def gql(query: str, variables: dict | None = None, env: str | None = None) -> di
             headers=headers,
             timeout=30,
         )
-    except httpx.ConnectError:
+    except httpx.ConnectError as exc:
         base_url = graphql_url.removesuffix("/graphql")
         raise RuntimeError(
             f"Cannot connect to Dagster at {base_url}. "
             "Check that DAGSTER_URL is correct and the instance is running."
-        )
-    except httpx.TimeoutException:
+        ) from exc
+    except httpx.TimeoutException as exc:
         base_url = graphql_url.removesuffix("/graphql")
-        raise RuntimeError(f"Request to Dagster at {base_url} timed out after 30s.")
+        raise RuntimeError(
+            f"Request to Dagster at {base_url} timed out after 30s."
+        ) from exc
     if response.status_code >= 400:
         raise RuntimeError(f"Dagster returned HTTP {response.status_code}: {response.text[:500]}")
     data = response.json()
@@ -1042,7 +1045,7 @@ def resolve_asset_selection(asset_selection: str, env: str | None = None) -> dic
     nodes = gql(query, env=env).get("assetNodes", [])
     try:
         resolved = evaluate_asset_selection(nodes, expression)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - report to the agent, never crash the tool
         # Evaluation-time failures (e.g. unexpected node shape) return a
         # structured message rather than an unhandled tool error.
         return {
@@ -1869,15 +1872,16 @@ def _locate_instigators(
           nodes {
             name
             location { name }
-            schedules { name%s }
-            sensors { name%s }
+            schedules { name__SCHEDULE_STATE__ }
+            sensors { name__SENSOR_STATE__ }
           }
         }
         ... on RepositoryNotFoundError { message }
         ... on PythonError { message }
       }
     """
-        % (state_fields, sensor_state_fields)
+        .replace("__SCHEDULE_STATE__", state_fields)
+        .replace("__SENSOR_STATE__", sensor_state_fields)
         + _WORKSPACE_LOAD_STATUS_SELECTION
         + """
     }

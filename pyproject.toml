@@ -20,7 +20,7 @@ Issues = "https://github.com/fabdendev/dagster-mcp/issues"
 dagster-mcp = "dagster_mcp.server:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=9.0", "ruff>=0.14"]
+dev = ["pytest>=9.0", "ruff>=0.16"]
 
 [build-system]
 requires = ["hatchling"]
@@ -31,3 +31,12 @@ packages = ["dagster_mcp"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.ruff.lint]
+# Selected explicitly rather than relying on ruff's defaults, which change
+# between releases: a new ruff should not fail CI on code nobody touched.
+select = ["E4", "E7", "E9", "F", "I", "UP", "SIM", "B", "BLE"]
+# TRY004 is deliberately absent. It asks for TypeError when an isinstance check
+# fails, but the malformed values here arrive from Dagster over the network
+# rather than from a caller, and RuntimeError with a diagnostic message is this
+# project's error contract.

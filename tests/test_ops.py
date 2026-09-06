@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from dagster_mcp import server
-from dagster_mcp.server import list_jobs, list_schedules, list_sensors, get_tick_history
+from dagster_mcp.server import get_tick_history, list_jobs, list_schedules, list_sensors
 
 
 class TestListJobs:
