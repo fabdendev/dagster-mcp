@@ -336,7 +336,7 @@ health directly.
 
 | Tool | Description |
 |------|-------------|
-| `materialize_assets` | Launch concrete, unpartitioned asset keys with run config and tags; infers one compatible repository/job, includes compatible checks, and expands required non-subsettable multi-asset neighbors |
+| `materialize_assets` | Launch concrete, unpartitioned asset keys with run config and tags; infers one compatible repository/job, includes compatible checks, and expands required non-subsettable multi-asset neighbors. On a failed launch it returns the preflight context plus `error` and `message` rather than raising, and omits `launched_asset_keys` |
 | `backfill_assets` | Launch a partition backfill by **asset selection** with optional run config; respects each asset's `BackfillPolicy` server-side |
 | `launch_job` | Launch a named job; `asset_keys` remains supported for compatibility and is sent through GraphQL `assetSelection`, but the two-step asset workflow is preferred |
 | `launch_job_with_partitions` | Launch a partitioned job for one or more partition keys; creates a backfill (supports `from_failure` to retry only failed steps) |
