@@ -368,30 +368,75 @@ class TestMaterializeAssets:
 
         assert result["job_name"] == "__ASSET_JOB_2"
 
-    def test_graphql_launch_error_keeps_preflight_context(self, monkeypatch):
+    def _launch_failure(self, monkeypatch, launch_payload):
+        """Drive materialize_assets to the launch step and return its result."""
         node = _materializable_node("a")
         mock_post = MagicMock(
             side_effect=[
                 _mock_response(_asset_nodes([node])),
                 _mock_response(_requirements()),
-                _mock_response(
-                    {
-                        "data": {
-                            "launchRun": {
-                                "errors": [{"message": "Invalid config"}]
-                            }
-                        }
-                    }
-                ),
+                _mock_response({"data": {"launchRun": launch_payload}}),
             ]
         )
         monkeypatch.setattr(httpx, "post", mock_post)
+        return materialize_assets(["a"], run_config={"bad": True}), mock_post
 
-        result = materialize_assets(["a"], run_config={"bad": True})
+    def test_graphql_launch_error_keeps_preflight_context(self, monkeypatch):
+        # This tool reports instead of raising so the caller keeps the preflight
+        # context, but the failure must be unmistakable.
+        result, _ = self._launch_failure(
+            monkeypatch,
+            {
+                "__typename": "RunConfigValidationInvalid",
+                "errors": [{"message": "Invalid config"}],
+            },
+        )
 
-        assert result["errors"] == [{"message": "Invalid config"}]
+        assert result["error"] == "launch_failed"
+        assert "Invalid config" in result["message"]
         assert result["job_name"] == "__ASSET_JOB"
         assert result["asset_keys"] == ["a"]
+
+    def test_launch_failure_does_not_claim_assets_launched(self, monkeypatch):
+        # The old shape merged {} on failure, leaving launched_asset_keys=["a"]
+        # with no run and no message — an agent read that as success.
+        result, _ = self._launch_failure(
+            monkeypatch, {"__typename": "PipelineNotFoundError", "message": "no job"}
+        )
+
+        assert "launched_asset_keys" not in result
+        assert "run" not in result
+        assert result["error"] == "launch_failed"
+        assert "no job" in result["message"]
+
+    def test_launch_failure_on_unlisted_union_member(self, monkeypatch):
+        # __typename is what makes an unselected member detectable.
+        result, _ = self._launch_failure(monkeypatch, {"__typename": "RunConflict"})
+
+        assert result["error"] == "launch_failed"
+        assert "RunConflict" in result["message"]
+        assert "launched_asset_keys" not in result
+
+    def test_typeless_launch_payload_names_the_selector(self, monkeypatch):
+        result, _ = self._launch_failure(monkeypatch, {})
+
+        assert result["error"] == "launch_failed"
+        assert "repository_name" in result["message"]
+        assert "launched_asset_keys" not in result
+
+    def test_launch_selection_requests_typename_and_error_members(self, monkeypatch):
+        _, mock_post = self._launch_failure(
+            monkeypatch, {"__typename": "PipelineNotFoundError", "message": "x"}
+        )
+
+        query = mock_post.call_args_list[2].kwargs["json"]["query"]
+        assert "__typename" in query
+        for member in (
+            "PipelineNotFoundError",
+            "InvalidStepError",
+            "UnauthorizedError",
+        ):
+            assert f"... on {member} {{ message }}" in query
 
     def test_empty_asset_list_fails(self):
         assert "message" in materialize_assets([])

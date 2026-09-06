@@ -1396,42 +1396,45 @@ def _workspace_location_entries(
     )
 
 
-def _unwrap_launch_result(
+def _classify_launch_result(
     data: Mapping[str, Any], field: str, context: str
-) -> dict[str, Any]:
-    """Decode a launch mutation union, raising on anything but success.
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Classify a launch mutation union as success or failure.
 
     Dagster answers a launch mutation with a union. A failure such as
     ``PipelineNotFoundError`` is a *successful* GraphQL response — ``gql`` sees
     no ``errors`` key and returns normally — so a selection set that omits that
     member decodes to ``{}`` and the caller reports a launch that never
-    happened. Decode strictly instead: anything that is not a
-    ``LaunchRunSuccess``/``LaunchBackfillSuccess`` raises with Dagster's own
-    message.
+    happened. Selecting ``__typename`` is what makes that detectable, including
+    for union members the selection does not name.
+
+    Returns ``(payload, None)`` when the run launched, or ``(None, message)``
+    when it did not. Callers decide whether to raise or to return the message
+    alongside their own context.
     """
     response = data.get(field)
     if not isinstance(response, Mapping):
-        raise RuntimeError(
+        return None, (
             f"Dagster returned no {field} payload while {context}. "
             "The job, repository, or code location name is probably wrong."
         )
 
     typename = response.get("__typename")
     if typename in ("LaunchRunSuccess", "LaunchBackfillSuccess"):
-        return dict(response)
+        return dict(response), None
 
     if typename == "RunConfigValidationInvalid":
         errors = response.get("errors")
         details = "; ".join(
             e.get("message", str(e)) for e in errors if isinstance(e, Mapping)
         ) if isinstance(errors, list) else ""
-        raise RuntimeError(
+        return None, (
             f"Dagster rejected the run config while {context}: "
             f"{details or 'No error message was provided'}"
         )
 
     if typename is None:
-        raise RuntimeError(
+        return None, (
             f"Dagster returned an unrecognized {field} result while {context}. "
             "This usually means the selector matched no job — check "
             "repository_name (it is NOT always '__repository__'), "
@@ -1441,7 +1444,17 @@ def _unwrap_launch_result(
     message = response.get("message")
     if not isinstance(message, str):
         message = "No error message was provided"
-    raise RuntimeError(f"Dagster failed while {context} ({typename}): {message}")
+    return None, f"Dagster failed while {context} ({typename}): {message}"
+
+
+def _unwrap_launch_result(
+    data: Mapping[str, Any], field: str, context: str
+) -> dict[str, Any]:
+    """Decode a launch mutation union, raising on anything but success."""
+    payload, error = _classify_launch_result(data, field, context)
+    if error is not None:
+        raise RuntimeError(error)
+    return payload or {}
 
 
 def _raise_for_unavailable_code_locations(
@@ -2851,8 +2864,12 @@ def materialize_assets(
         runConfigData: $runConfigData,
         executionMetadata: $executionMetadata
       }) {
+        __typename
         ... on LaunchRunSuccess { run { runId status } }
         ... on InvalidSubsetError { message }
+        ... on PipelineNotFoundError { message }
+        ... on InvalidStepError { message }
+        ... on UnauthorizedError { message }
         ... on PythonError { message }
         ... on PresetNotFoundError { message }
         ... on ConflictingExecutionParamsError { message }
@@ -2860,7 +2877,7 @@ def materialize_assets(
       }
     }
     """
-    launch_result = gql(
+    launch_data = gql(
         mutation,
         {
             "locationName": repository_location,
@@ -2872,7 +2889,7 @@ def materialize_assets(
             "executionMetadata": execution_metadata,
         },
         env=env,
-    ).get("launchRun", {})
+    )
 
     result = {
         "job_name": job_name,
@@ -2880,10 +2897,24 @@ def materialize_assets(
         "repository_name": repository_name,
         "requested_asset_keys": requested_keys,
         "asset_keys": launched_keys,
-        "launched_asset_keys": launched_keys,
         "required_asset_keys_added": required_keys,
     }
-    result.update(launch_result)
+
+    launch_result, error = _classify_launch_result(
+        launch_data, "launchRun", f"materializing {', '.join(launched_keys)}"
+    )
+    if error is not None:
+        # Unlike the other launch tools this one reports rather than raises, so
+        # the caller keeps the preflight context — which assets resolved, which
+        # job was chosen — when diagnosing the failure. "launched_asset_keys" is
+        # deliberately absent: nothing launched, and an agent reads that key as
+        # proof that it did.
+        result["error"] = "launch_failed"
+        result["message"] = error
+        return result
+
+    result["launched_asset_keys"] = launched_keys
+    result.update(launch_result or {})
     return result
 
 
