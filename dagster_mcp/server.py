@@ -1446,7 +1446,12 @@ def _classify_launch_result(
 
     message = response.get("message")
     if not isinstance(message, str):
-        message = "No error message was provided"
+        # InvalidStepError is the one selected member without a message field.
+        step_key = response.get("invalidStepKey")
+        if isinstance(step_key, str):
+            message = f"invalid step key {step_key!r}"
+        else:
+            message = "No error message was provided"
     return None, f"Dagster failed while {context} ({typename}): {message}"
 
 
@@ -2872,7 +2877,7 @@ def materialize_assets(
         ... on LaunchRunSuccess { run { runId status } }
         ... on InvalidSubsetError { message }
         ... on PipelineNotFoundError { message }
-        ... on InvalidStepError { message }
+        ... on InvalidStepError { invalidStepKey }
         ... on UnauthorizedError { message }
         ... on PythonError { message }
         ... on PresetNotFoundError { message }
@@ -3021,7 +3026,7 @@ def launch_job(
         ... on LaunchRunSuccess { run { runId status } }
         ... on InvalidSubsetError { message }
         ... on PipelineNotFoundError { message }
-        ... on InvalidStepError { message }
+        ... on InvalidStepError { invalidStepKey }
         ... on UnauthorizedError { message }
         ... on PythonError { message }
         ... on PresetNotFoundError { message }

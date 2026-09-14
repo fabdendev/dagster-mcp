@@ -5,6 +5,36 @@ import httpx
 import pytest
 
 from dagster_mcp import server as _server_mod
+from tests import graphql_schema
+
+
+@pytest.fixture(autouse=True)
+def graphql_documents_match_dagster_schema(monkeypatch):
+    """Fail any test whose tool sends a document Dagster's schema would reject.
+
+    Wraps ``server.gql`` rather than ``httpx.post``, because tests replace
+    ``httpx.post`` with their own mocks. Tests that replace ``server.gql`` itself
+    send nothing and are not checked. Errors are collected and reported at
+    teardown because some tools catch exceptions raised during a call.
+    """
+    if not graphql_schema.AVAILABLE:
+        yield
+        return
+
+    invalid: list[str] = []
+    real_gql = _server_mod.gql
+
+    def checked_gql(query, *args, **kwargs):
+        invalid.extend(graphql_schema.schema_errors(query))
+        return real_gql(query, *args, **kwargs)
+
+    monkeypatch.setattr(_server_mod, "gql", checked_gql)
+    yield
+    if invalid:
+        pytest.fail(
+            "GraphQL document rejected by Dagster's schema:\n"
+            + "\n".join(dict.fromkeys(invalid))
+        )
 
 
 @pytest.fixture(autouse=True)
