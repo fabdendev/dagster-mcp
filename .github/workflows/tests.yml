@@ -29,4 +29,4 @@ jobs:
         run: uv run ruff check dagster_mcp/
 
       - name: Test
-        run: uv run pytest --tb=short
+        run: uv run --with dagster-graphql==1.13.8 pytest --tb=short

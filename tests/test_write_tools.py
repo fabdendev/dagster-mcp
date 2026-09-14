@@ -431,12 +431,20 @@ class TestMaterializeAssets:
 
         query = mock_post.call_args_list[2].kwargs["json"]["query"]
         assert "__typename" in query
-        for member in (
-            "PipelineNotFoundError",
-            "InvalidStepError",
-            "UnauthorizedError",
-        ):
+        for member in ("PipelineNotFoundError", "UnauthorizedError"):
             assert f"... on {member} {{ message }}" in query
+        # InvalidStepError has no message field; selecting one fails validation
+        # before the mutation runs (issue #36).
+        assert "... on InvalidStepError { invalidStepKey }" in query
+
+    def test_invalid_step_error_names_the_step(self, monkeypatch):
+        result, _ = self._launch_failure(
+            monkeypatch, {"__typename": "InvalidStepError", "invalidStepKey": "my_op"}
+        )
+
+        assert result["error"] == "launch_failed"
+        assert "invalid step key 'my_op'" in result["message"]
+        assert "launched_asset_keys" not in result
 
     def test_empty_asset_list_fails(self):
         assert "message" in materialize_assets([])
@@ -598,6 +606,14 @@ class TestLaunchResultIsDecodedStrictly:
         query = mock_post.call_args.kwargs["json"]["query"]
         assert "__typename" in query
         assert "... on PipelineNotFoundError { message }" in query
+        assert "... on InvalidStepError { invalidStepKey }" in query
+
+    def test_invalid_step_error_names_the_step(self, mock_gql):
+        mock_gql({"data": {"launchRun": {
+            "__typename": "InvalidStepError", "invalidStepKey": "my_op",
+        }}})
+        with pytest.raises(RuntimeError, match="invalid step key 'my_op'"):
+            launch_job("my_job", "loc1", "repo1")
 
     def test_unmatched_union_member_raises_with_selector_guidance(self, mock_gql):
         # No __typename at all: exactly what the old selection produced.

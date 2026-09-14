@@ -50,7 +50,7 @@ jobs:
 
       - name: Test
         if: steps.check.outputs.exists == 'false'
-        run: uv run pytest --tb=short
+        run: uv run --with dagster-graphql==1.13.8 pytest --tb=short
 
       - name: Build
         if: steps.check.outputs.exists == 'false'
