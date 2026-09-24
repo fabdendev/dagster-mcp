@@ -5,6 +5,7 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 from typing import Any, Final, TypedDict
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastmcp import FastMCP
@@ -273,12 +274,30 @@ def gql(query: str, variables: dict | None = None, env: str | None = None) -> di
         raise RuntimeError(
             f"Request to Dagster at {base_url} timed out after 30s."
         ) from exc
+    if 300 <= response.status_code < 400:
+        location = response.headers.get("location")
+        destination = urlparse(urljoin(graphql_url, location)).netloc if location else "unknown"
+        raise RuntimeError(
+            f"Dagster returned HTTP {response.status_code} redirect to {destination}. "
+            "Check DAGSTER_URL and refresh the configured authentication token or headers."
+        )
     if response.status_code >= 400:
         raise RuntimeError(f"Dagster returned HTTP {response.status_code}: {response.text[:500]}")
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Dagster returned HTTP {response.status_code} with a non-JSON response "
+            f"(content type: {response.headers.get('content-type', 'unknown')}). "
+            "Check DAGSTER_URL and authentication."
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Dagster returned an invalid GraphQL response: expected a JSON object.")
     if "errors" in data:
         messages = [e.get("message", str(e)) for e in data["errors"]]
         raise RuntimeError("Dagster GraphQL error: " + "; ".join(messages))
+    if "data" not in data:
+        raise RuntimeError("Dagster returned an invalid GraphQL response: missing data field.")
     return data["data"]
 
 

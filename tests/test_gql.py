@@ -31,6 +31,32 @@ class TestGql:
         with pytest.raises(RuntimeError, match="HTTP 500"):
             gql("query { }")
 
+    def test_auth_redirect_reports_destination_without_query_string(self, monkeypatch):
+        response = httpx.Response(
+            302,
+            headers={"location": "https://auth.wellfound.com/login?state=secret"},
+        )
+        monkeypatch.setattr(httpx, "post", MagicMock(return_value=response))
+        with pytest.raises(RuntimeError, match="HTTP 302 redirect to auth.wellfound.com") as exc:
+            gql("query { }")
+        assert "refresh the configured authentication" in str(exc.value)
+        assert "secret" not in str(exc.value)
+
+    def test_non_json_success_reports_content_type(self, monkeypatch):
+        response = httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text="<html>Sign in</html>",
+        )
+        monkeypatch.setattr(httpx, "post", MagicMock(return_value=response))
+        with pytest.raises(RuntimeError, match="HTTP 200 with a non-JSON response.*text/html"):
+            gql("query { }")
+
+    def test_missing_graphql_data_reports_invalid_response(self, mock_gql):
+        mock_gql({"message": "OK"})
+        with pytest.raises(RuntimeError, match="missing data field"):
+            gql("query { }")
+
     def test_graphql_errors(self, mock_gql):
         mock_gql({
             "errors": [{"message": "Field 'foo' not found"}],
