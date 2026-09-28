@@ -276,7 +276,14 @@ def gql(query: str, variables: dict | None = None, env: str | None = None) -> di
         ) from exc
     if 300 <= response.status_code < 400:
         location = response.headers.get("location")
-        destination = urlparse(urljoin(graphql_url, location)).netloc if location else "unknown"
+        destination = "unknown"
+        if location:
+            parsed = urlparse(urljoin(graphql_url, location))
+            # hostname omits userinfo (unlike netloc) so credentials in Location
+            # never reach the message shown to LLM clients or logs.
+            host = parsed.hostname
+            if host:
+                destination = f"{host}:{parsed.port}" if parsed.port else host
         raise RuntimeError(
             f"Dagster returned HTTP {response.status_code} redirect to {destination}. "
             "Check DAGSTER_URL and refresh the configured authentication token or headers."

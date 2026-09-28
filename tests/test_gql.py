@@ -42,6 +42,19 @@ class TestGql:
         assert "refresh the configured authentication" in str(exc.value)
         assert "secret" not in str(exc.value)
 
+    def test_auth_redirect_reports_destination_without_userinfo(self, monkeypatch):
+        response = httpx.Response(
+            302,
+            headers={"location": "https://svc:s3cret@auth.internal:8443/login"},
+        )
+        monkeypatch.setattr(httpx, "post", MagicMock(return_value=response))
+        with pytest.raises(RuntimeError, match="HTTP 302 redirect to auth.internal:8443") as exc:
+            gql("query { }")
+        message = str(exc.value)
+        assert "svc" not in message
+        assert "s3cret" not in message
+        assert "@" not in message
+
     def test_non_json_success_reports_content_type(self, monkeypatch):
         response = httpx.Response(
             200,
