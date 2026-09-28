@@ -29,4 +29,14 @@ jobs:
         run: uv run ruff check dagster_mcp/
 
       - name: Test
-        run: uv run --with dagster-graphql==1.13.8 pytest --tb=short
+        # --extra dev keeps pytest from the project venv. Without it uv can fall
+        # through to a pytest elsewhere on PATH, in an environment with a
+        # different dagster-graphql, and validate against the wrong schema.
+        run: uv run --extra dev --with dagster-graphql==1.13.8 pytest --tb=short
+
+      - name: Validate GraphQL documents against the oldest supported schema
+        # dagster 1.7 needs an older grpcio that does not build on Python 3.13.
+        if: matrix.python-version == '3.12'
+        run: >-
+          uv run --extra dev --with dagster-graphql==1.7.16
+          pytest --tb=short tests/test_server_documents.py tests/test_graphql_schema.py
